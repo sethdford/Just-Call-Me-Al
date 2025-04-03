@@ -76,6 +76,8 @@ output_*/
 basic_audio.wav
 full_conversation.wav
 context_audio.wav
+.specstory/
+multiple
 
 # Added by Claude Task Master
 # Logs
