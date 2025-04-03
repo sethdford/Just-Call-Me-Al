@@ -1,0 +1,199 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# Project Workflow Management
+
+## Project Structure
+
+```
+project_root/
+  ├── src/                    # Source code
+  │   ├── audio/             # Audio processing modules
+  │   ├── models/            # ML models and types
+  │   └── utils/             # Shared utilities
+  ├── tests/                 # Test suite
+  ├── docs/                  # Documentation
+  └── .cursor/               # Cursor metadata
+      ├── tasks/             # Task management
+      ├── memory/            # Context memory
+      └── rules/             # Project rules
+```
+
+## Development Lifecycle
+
+1. **Feature Development**
+   ```rust
+   pub struct FeatureLifecycle {
+       planning: Vec<PlanningStep>,
+       implementation: Vec<ImplementationStep>,
+       testing: Vec<TestStep>,
+       review: Vec<ReviewStep>,
+   }
+   ```
+
+2. **Code Review Process**
+   ```rust
+   pub struct ReviewProcess {
+       checklist: Vec<CheckItem>,
+       required_approvers: u32,
+       auto_checks: Vec<AutomatedCheck>,
+   }
+   ```
+
+## Quality Standards
+
+1. **Code Quality**
+   - Follow Rust idioms and best practices
+   - Maintain consistent error handling
+   - Use proper type safety
+   - Document public interfaces
+   - Write unit tests for new functionality
+
+2. **Performance Requirements**
+   - Profile audio processing functions
+   - Optimize memory usage
+   - Minimize allocations in hot paths
+   - Use async/await appropriately
+   - Implement proper buffering
+
+3. **Safety Requirements**
+   - Validate all inputs
+   - Handle all error cases
+   - Use proper mutex guards
+   - Implement proper resource cleanup
+   - Follow safe Rust practices
+
+## Testing Strategy
+
+1. **Test Categories**
+   ```rust
+   pub enum TestType {
+       Unit,           // Individual component tests
+       Integration,    // Component interaction tests
+       Performance,    // Performance benchmarks
+       Stress,        // Load testing
+       Acceptance,    // Feature acceptance tests
+   }
+   ```
+
+2. **Test Coverage**
+   - Minimum 80% code coverage
+   - Critical paths must have 100% coverage
+   - Include error cases
+   - Test async behavior
+   - Test resource cleanup
+
+## Documentation Requirements
+
+1. **Code Documentation**
+   - Document all public interfaces
+   - Include examples in doc comments
+   - Explain complex algorithms
+   - Document unsafe blocks
+   - Maintain CHANGELOG.md
+
+2. **Project Documentation**
+   - Architecture overview
+   - Setup instructions
+   - API documentation
+   - Performance guidelines
+   - Troubleshooting guide
+
+## Release Process
+
+1. **Release Checklist**
+   ```rust
+   pub struct ReleaseProcess {
+       version_bump: VersionUpdate,
+       changelog_update: ChangelogUpdate,
+       tests: TestSuite,
+       documentation: DocUpdate,
+       deployment: DeploymentStep,
+   }
+   ```
+
+2. **Version Control**
+   - Use semantic versioning
+   - Tag releases
+   - Maintain release branches
+   - Follow git flow
+
+## Performance Monitoring
+
+1. **Metrics**
+   ```rust
+   pub struct PerformanceMetrics {
+       audio_latency: Duration,
+       memory_usage: ByteSize,
+       cpu_usage: Percentage,
+       error_rate: Rate,
+   }
+   ```
+
+2. **Benchmarks**
+   - Audio processing speed
+   - Memory consumption
+   - API response times
+   - Resource utilization
+
+## Error Handling
+
+1. **Error Categories**
+   ```rust
+   pub enum ErrorCategory {
+       AudioProcessing,
+       ModelInference,
+       ResourceExhaustion,
+       InvalidInput,
+       SystemError,
+   }
+   ```
+
+2. **Error Recovery**
+   - Implement retry mechanisms
+   - Use circuit breakers
+   - Log detailed error context
+   - Maintain error statistics
+
+## Continuous Integration
+
+1. **CI Pipeline**
+   ```rust
+   pub struct CIPipeline {
+       build: BuildStep,
+       test: TestStep,
+       lint: LintStep,
+       security_scan: SecurityScan,
+       performance_test: PerfTest,
+   }
+   ```
+
+2. **Automated Checks**
+   - Run clippy
+   - Check formatting
+   - Run security audits
+   - Check dependencies
+   - Run benchmarks
+
+## Best Practices
+
+1. **Code Organization**
+   - Follow module hierarchy
+   - Use proper visibility
+   - Implement traits appropriately
+   - Maintain separation of concerns
+
+2. **Resource Management**
+   - Implement proper cleanup
+   - Use RAII patterns
+   - Handle async cancellation
+   - Monitor resource usage
+
+3. **Security**
+   - Validate all inputs
+   - Handle sensitive data properly
+   - Implement proper access control
+   - Follow security best practices

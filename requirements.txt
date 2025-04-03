@@ -1,0 +1,3 @@
+jiwer
+librosa
+praat-parselmouth 

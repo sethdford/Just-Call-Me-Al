@@ -1,0 +1,37 @@
+# Rust Testing Standards
+
+1. Test Organization
+   - Place unit tests in a `tests` submodule within the same file (`#[cfg(test)] mod tests { ... }`) or in a separate `tests/` directory for integration tests.
+   - Name test functions descriptively, often starting with `test_`.
+   - Use `#[test]` attribute for regular tests and `#[tokio::test]` for async tests.
+
+2. Test Coverage
+   - Aim for high test coverage, especially for critical logic and public APIs.
+   - Test success paths, error paths, and edge cases.
+   - Use tools like `cargo-tarpaulin` or `grcov` to measure coverage (optional).
+
+3. Assertions
+   - Use standard assertion macros (`assert!`, `assert_eq!`, `assert_ne!`).
+   - Use `matches!` macro for checking enum variants or patterns.
+   - Use `assert!(result.is_ok())` or `assert!(result.is_err())` for `Result` types.
+   - Provide helpful assertion messages, especially for `assert!`. Example: `assert!(value > 10, "Value {} was not greater than 10", value);`
+
+4. Test Setup and Teardown
+   - Use helper functions or fixtures for common setup logic.
+   - Ensure tests are independent and do not rely on the state of previous tests.
+   - Clean up any created resources (files, database entries) after tests.
+
+5. Mocking and Fakes
+   - Use mocking libraries (e.g., `mockall`) or test doubles (fakes) for external dependencies or complex components.
+   - Keep mocks focused on the interaction being tested.
+
+6. Integration Tests
+   - Test the interaction between different modules or components.
+   - Simulate real-world scenarios where possible.
+   - May require external resources (database, network services) - consider using test containers or dedicated test environments.
+
+7. Property-Based Testing (Optional)
+   - Consider using libraries like `proptest` or `quickcheck` to generate a wide range of inputs and test properties that should always hold true.
+
+8. Documentation Tests
+   - Write doctests within `///` comments to demonstrate API usage and ensure examples stay correct. 

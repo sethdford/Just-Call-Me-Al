@@ -1,0 +1,220 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Rust Code Guidelines
+
+## Code Organization
+
+- **Module Structure**
+  - One module per file
+  - Use `mod.rs` for module hierarchies
+  - Keep public interface minimal
+  ```rust
+  // ✅ DO: Clear module structure
+  pub mod audio {
+      mod processor;
+      mod stream;
+      pub use processor::AudioProcessor;
+      pub use stream::AudioStream;
+  }
+
+  // ❌ DON'T: Expose internal details
+  pub mod audio {
+      pub mod processor;  // Don't expose entire modules
+      pub mod stream;
+  }
+  ```
+
+- **Type Organization**
+  - Group related types together
+  - Use type aliases for complex types
+  - Implement common traits
+  ```rust
+  // ✅ DO: Organize related types
+  pub struct AudioProcessor {
+      config: AudioConfig,
+      stream: AudioStream,
+  }
+
+  pub type Result<T> = std::result::Result<T, AudioError>;
+
+  impl AudioProcessor {
+      // Implementation
+  }
+
+  // ❌ DON'T: Mix unrelated functionality
+  pub struct AudioProcessor {
+      config: AudioConfig,
+      db_connection: DbConnection,  // Should be separate
+  }
+  ```
+
+## Error Handling
+
+- **Custom Error Types**
+  - Use `thiserror` for library errors
+  - Use `anyhow` for application errors
+  - Provide context in error messages
+  ```rust
+  // ✅ DO: Define clear error types
+  #[derive(Debug, thiserror::Error)]
+  pub enum AudioError {
+      #[error("Failed to initialize device: {0}")]
+      DeviceError(String),
+      #[error("Invalid sample rate: {0}")]
+      InvalidSampleRate(u32),
+  }
+
+  // ❌ DON'T: Use string errors
+  fn process() -> Result<(), String> {
+      Err("something went wrong".to_string())
+  }
+  ```
+
+- **Error Propagation**
+  - Use the `?` operator for error propagation
+  - Add context with `.context()`
+  - Handle errors at appropriate levels
+  ```rust
+  // ✅ DO: Proper error propagation
+  fn process_audio() -> Result<()> {
+      let data = read_file("audio.wav")
+          .context("Failed to read audio file")?;
+      process_data(&data)
+          .context("Failed to process audio data")?;
+      Ok(())
+  }
+
+  // ❌ DON'T: Panic or unwrap in library code
+  fn process_audio() {
+      let data = read_file("audio.wav").unwrap();
+  }
+  ```
+
+## Testing
+
+- **Test Organization**
+  - Use `#[cfg(test)]` modules
+  - Separate unit and integration tests
+  - Use test utilities module
+  ```rust
+  // ✅ DO: Organized tests
+  #[cfg(test)]
+  mod tests {
+      use super::*;
+      
+      #[tokio::test]
+      async fn test_audio_processing() {
+          let processor = AudioProcessor::new();
+          assert!(processor.process().await.is_ok());
+      }
+  }
+
+  // ❌ DON'T: Mix test and production code
+  fn process() {
+      #[cfg(test)]
+      return Ok(());  // Don't mix test logic in production code
+  }
+  ```
+
+## Performance
+
+- **Zero-Cost Abstractions**
+  - Use generics over trait objects when possible
+  - Minimize allocations
+  - Use appropriate data structures
+  ```rust
+  // ✅ DO: Efficient abstractions
+  pub struct AudioBuffer<T> {
+      data: Vec<T>,
+  }
+
+  impl<T: Sample> AudioBuffer<T> {
+      pub fn process(&self) -> Result<()> {
+          // Implementation
+      }
+  }
+
+  // ❌ DON'T: Unnecessary boxing
+  pub struct AudioBuffer {
+      data: Box<Vec<f32>>,  // Unnecessary Box
+  }
+  ```
+
+## Documentation
+
+- **Doc Comments**
+  - Document public interfaces
+  - Include examples
+  - Document error cases
+  ```rust
+  /// Process audio data with the given configuration.
+  ///
+  /// # Examples
+  ///
+  /// ```
+  /// let processor = AudioProcessor::new();
+  /// processor.process(data)?;
+  /// ```
+  ///
+  /// # Errors
+  ///
+  /// Returns `AudioError::InvalidInput` if the data is invalid.
+  pub fn process(&self, data: &[f32]) -> Result<()> {
+      // Implementation
+  }
+  ```
+## Standardization
+
+- **Code Organization**
+  - Follow consistent module hierarchy
+  - Use standard naming patterns
+  - Maintain consistent error handling
+  ```rust
+  // ✅ DO: Consistent module structure
+  my_crate/
+    ├── lib.rs       // Public API
+    ├── error.rs     // Error types
+    ├── config.rs    // Configuration
+    └── internal/    // Implementation details
+        ├── mod.rs
+        └── utils.rs
+  ```
+
+- **API Design**
+  - Follow Rust API guidelines
+  - Use builder pattern for complex objects
+  - Implement standard traits
+  ```rust
+  // ✅ DO: Standard API patterns
+  impl AudioProcessor {
+      pub fn builder() -> AudioProcessorBuilder {
+          AudioProcessorBuilder::default()
+      }
+  }
+
+  #[derive(Default)]
+  pub struct AudioProcessorBuilder {
+      sample_rate: Option<u32>,
+      channels: Option<u8>,
+  }
+  ```
+  
+## Dependencies
+
+- **Dependency Management**
+  - Use specific versions
+  - Minimize dependencies
+  - Use features to control functionality
+  ```toml
+  # ✅ DO: Specific versions and features
+  [dependencies]
+  tokio = { version = "1.35", features = ["full"] }
+  serde = { version = "1.0", features = ["derive"] }
+
+  # ❌ DON'T: Use * or unspecified features
+  [dependencies]
+  tokio = "*"  # Don't use wildcards
+  ```

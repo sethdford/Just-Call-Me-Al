@@ -1,0 +1,30 @@
+# Test Strategy
+
+1. Unit Tests
+   - Focus: Test individual functions, methods, or small units of code in isolation.
+   - Location: `#[cfg(test)]` modules within the source files.
+   - Goal: Verify the correctness of specific logic, algorithms, and edge cases.
+   - Dependencies: Mock or fake external dependencies.
+
+2. Integration Tests
+   - Focus: Test the interaction between multiple components or modules.
+   - Location: `tests/` directory at the crate root.
+   - Goal: Verify that different parts of the system work together as expected.
+   - Dependencies: May interact with real (but controlled) external systems like a test database.
+
+3. End-to-End (E2E) Tests (if applicable)
+   - Focus: Test complete user workflows or application scenarios from start to finish.
+   - Location: Often in a separate test suite or crate.
+   - Goal: Verify the entire system behaves correctly from an external perspective.
+   - Dependencies: Interact with the fully deployed application or a close simulation.
+
+4. Test Data
+   - Use realistic but controlled test data.
+   - Avoid relying on external services that might change.
+   - Generate test data programmatically or use fixtures.
+
+5. CI Integration
+   - All tests (unit, integration) should be run automatically in the Continuous Integration (CI) pipeline.
+   - Failing tests must block merging/deployment.
+
+See `rust_testing.mdc` for specific implementation standards. 

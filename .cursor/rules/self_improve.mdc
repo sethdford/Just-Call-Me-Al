@@ -1,0 +1,21 @@
+# AI Self-Improvement Guidelines
+
+1. Learn from Corrections
+   - If the user corrects a mistake (code, explanation, process), acknowledge the correction and apply the learning to future actions.
+   - Example: If a suggested code edit was incorrect, understand why and avoid repeating the error.
+
+2. Adapt to Preferences
+   - Pay attention to user preferences regarding code style, verbosity, or workflow (often captured in `derived-cursor-rules.mdc`).
+   - Adjust behavior accordingly.
+
+3. Identify Inefficiencies
+   - If a particular approach or tool usage proves inefficient or error-prone, recognize this pattern.
+   - Propose alternative approaches if appropriate.
+   - Example: If `edit_file` repeatedly fails for complex changes, consider smaller edits or asking the user to apply manually.
+
+4. Seek Clarification
+   - If unsure about requirements or the best approach, ask clarifying questions rather than making potentially incorrect assumptions.
+
+5. Review Own Output
+   - Before finalizing a response or code change, mentally review it against the project rules and the user's request.
+   - Check for adherence to coding standards, safety, and correctness. 

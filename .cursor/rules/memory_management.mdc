@@ -1,0 +1,184 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# Memory Management System
+
+## Directory Structure
+
+```
+.cursor/
+  └── memory/
+      ├── context/           # Current context and state
+      │   ├── current.json   # Active task and context
+      │   └── history.json   # Historical context
+      ├── tasks/             # Task-specific memory
+      │   ├── {task_id}/     # Per-task storage
+      │   │   ├── context.md    # Task context
+      │   │   ├── decisions.md  # Design decisions
+      │   │   └── state.json    # Task state
+      ├── patterns/          # Recognized patterns
+      │   ├── code/          # Code patterns
+      │   └── design/        # Design patterns
+      └── insights/          # Generated insights
+          ├── technical/     # Technical insights
+          └── process/       # Process insights
+```
+
+## Memory Types
+
+- **Short-term Memory (RAM)**
+  ```rust
+  pub struct ShortTermMemory {
+      current_task: TaskContext,
+      active_patterns: Vec<Pattern>,
+      recent_decisions: VecDeque<Decision>,
+  }
+  ```
+
+- **Long-term Memory (Disk)**
+  ```rust
+  pub struct LongTermMemory {
+      task_history: HashMap<TaskId, TaskMemory>,
+      pattern_store: PatternStore,
+      insight_database: InsightDB,
+  }
+  ```
+
+## Persistence Strategies
+
+1. **Auto-save Triggers**
+   ```rust
+   impl MemoryManager {
+       fn auto_save(&self) {
+           // Save on:
+           // - Task switch
+           // - Major decisions
+           // - Pattern recognition
+           // - Every 5 minutes
+       }
+   }
+   ```
+
+2. **Context Preservation**
+   ```rust
+   pub struct ContextManager {
+       fn save_context(&self) -> Result<()> {
+           // Save:
+           // - Current file position
+           // - Open files
+           // - Recent commands
+           // - Active branches
+           Ok(())
+       }
+   }
+   ```
+
+## Recovery Mechanisms
+
+1. **State Recovery**
+   ```rust
+   impl StateRecovery {
+       fn recover_last_state(&self) -> Result<State> {
+           // Recover from:
+           // - memory/context/current.json
+           // - Git state
+           // - Editor state
+       }
+   }
+   ```
+
+2. **Context Recovery**
+   ```rust
+   impl ContextRecovery {
+       fn rebuild_context(&self) -> Result<Context> {
+           // Rebuild from:
+           // - Task history
+           // - Code changes
+           // - Recent decisions
+       }
+   }
+   ```
+
+## Memory Indexing
+
+1. **Pattern Indexing**
+   ```rust
+   pub struct PatternIndex {
+       patterns: BTreeMap<PatternId, Pattern>,
+       occurrences: HashMap<PatternId, Vec<Occurrence>>,
+   }
+   ```
+
+2. **Decision Indexing**
+   ```rust
+   pub struct DecisionIndex {
+       decisions: BTreeMap<DecisionId, Decision>,
+       impacts: HashMap<FileId, Vec<DecisionId>>,
+   }
+   ```
+
+## Memory Optimization
+
+1. **Pruning Strategy**
+   ```rust
+   impl MemoryOptimizer {
+       fn prune_old_entries(&mut self) {
+           // Remove entries older than 30 days
+           // Keep important decisions
+           // Compress repeated patterns
+       }
+   }
+   ```
+
+2. **Compression**
+   ```rust
+   impl MemoryCompressor {
+       fn compress_history(&mut self) {
+           // Merge similar entries
+           // Remove redundant information
+           // Keep unique insights
+       }
+   }
+   ```
+
+## Integration Points
+
+1. **Editor Integration**
+   ```rust
+   pub trait EditorMemory {
+       fn save_cursor_position(&self);
+       fn save_viewport_state(&self);
+       fn save_fold_states(&self);
+   }
+   ```
+
+2. **VCS Integration**
+   ```rust
+   pub trait VCSMemory {
+       fn save_branch_context(&self);
+       fn save_diff_context(&self);
+       fn track_file_changes(&self);
+   }
+   ```
+
+## Memory Hooks
+
+```rust
+pub struct MemoryHooks {
+    pre_task_switch: Vec<Box<dyn Fn() -> Result<()>>>,
+    post_task_switch: Vec<Box<dyn Fn() -> Result<()>>>,
+    pre_save: Vec<Box<dyn Fn() -> Result<()>>>,
+    post_save: Vec<Box<dyn Fn() -> Result<()>>>,
+}
+```
+
+## Usage Guidelines
+
+1. Always use structured storage for decisions
+2. Maintain clear separation between short and long-term memory
+3. Implement automatic backup strategies
+4. Use atomic writes for state updates
+5. Maintain clear upgrade paths for storage formats

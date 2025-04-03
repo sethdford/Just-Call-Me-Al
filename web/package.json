@@ -1,0 +1,32 @@
+{
+  "name": "csm-web",
+  "version": "1.0.0",
+  "description": "CSM Web Client",
+  "main": "script.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "jest-environment-jsdom": "^29.7.0"
+  },
+  "jest": {
+    "rootDir": ".",
+    "testMatch": [
+      "<rootDir>/**/*.test.js"
+    ],
+    "testEnvironment": "jsdom",
+    "setupFiles": [
+      "./jest.setup.js"
+    ],
+    "coverageThreshold": {
+      "global": {
+        "statements": 80,
+        "branches": 80,
+        "functions": 80,
+        "lines": 80
+      }
+    }
+  }
+} 

@@ -1,0 +1,15 @@
+id,text,type,intended_emotion,intended_style
+sent_001,"The weather today is quite pleasant.",declarative,neutral,normal
+sent_002,"Did you remember to lock the door?",interrogative,neutral,normal
+sent_003,"Wow, that's absolutely fantastic news!",exclamatory,happy,normal
+sent_004,"I'm feeling a bit down today.",declarative,sad,normal
+sent_005,"Please be very quiet, everyone is asleep.",declarative,neutral,whispering
+sent_006,"Can you whisper the answer to me?",interrogative,any,whispering
+sent_007,"Oh no, I think I left my wallet at the restaurant.",exclamatory,sad,normal
+sent_008,"This is the happiest day of my life!",exclamatory,happy,normal
+sent_009,"The technical report needs careful review.",declarative,neutral,normal
+sent_010,"Shh, don't make a sound.",exclamatory,neutral,whispering
+"sent_011","The lead singer took the lead.","homograph","neutral","neutral"
+"sent_012","He will refuse to take out the refuse.","homograph","neutral","neutral"
+"sent_013","I read the book yesterday, but I need to read it again.","homograph","neutral","neutral"
+"sent_014","The wind is strong, so I need to wind my watch.","homograph","neutral","neutral" 

@@ -1,0 +1,139 @@
+---
+description: Guidelines for writing and maintaining unsafe Rust code safely
+globs: src/**/*.rs
+alwaysApply: true
+---
+
+# Unsafe Rust Guidelines
+
+## Unsafe Block Usage
+
+- **Minimizing Unsafe**
+  - Use unsafe only when necessary
+  - Document why unsafe is needed
+  - Encapsulate unsafe code in safe abstractions
+  ```rust
+  // ✅ DO: Document and encapsulate unsafe
+  /// Creates a raw pointer for direct memory access.
+  /// 
+  /// # Safety
+  /// Caller must ensure:
+  /// - Pointer remains valid for the duration of use
+  /// - No other references exist to this memory
+  pub unsafe fn create_raw_ptr(data: &[u8]) -> *const u8 {
+      data.as_ptr()
+  }
+
+  // ❌ DON'T: Leave unsafe blocks undocumented
+  unsafe fn dangerous_op() {
+      // Undocumented unsafe operations
+  }
+  ```
+
+## Safety Contracts
+
+- **Document Safety Requirements**
+  - List all invariants that must be maintained
+  - Explain what callers must guarantee
+  - Document potential undefined behavior
+  ```rust
+  /// # Safety
+  ///
+  /// Caller must ensure:
+  /// 1. The buffer is at least `len` bytes long
+  /// 2. The buffer is properly aligned
+  /// 3. No other references to this memory exist
+  pub unsafe fn write_bytes(ptr: *mut u8, val: u8, len: usize) {
+      std::ptr::write_bytes(ptr, val, len);
+  }
+  ```
+
+## Raw Pointer Handling
+
+- **Pointer Safety**
+  - Validate pointer alignment
+  - Check pointer validity
+  - Handle null pointers
+  ```rust
+  // ✅ DO: Validate pointers
+  unsafe fn process_ptr<T>(ptr: *const T) -> Option<T> 
+  where T: Copy {
+      if ptr.is_null() {
+          return None;
+      }
+      if (ptr as usize) % std::mem::align_of::<T>() != 0 {
+          return None;
+      }
+      Some(std::ptr::read(ptr))
+  }
+  ```
+
+## FFI Safety
+
+- **Foreign Function Interface**
+  - Use `repr(C)` for FFI structs
+  - Handle null pointers in FFI
+  - Document ownership transfer
+  ```rust
+  #[repr(C)]
+  pub struct FFIData {
+      ptr: *mut u8,
+      len: usize,
+  }
+
+  // ✅ DO: Safe FFI wrapper
+  impl FFIData {
+      pub fn as_slice(&self) -> Option<&[u8]> {
+          if self.ptr.is_null() {
+              return None;
+          }
+          unsafe {
+              Some(std::slice::from_raw_parts(
+                  self.ptr,
+                  self.len
+              ))
+          }
+      }
+  }
+  ```
+
+## Memory Safety
+
+- **Memory Management**
+  - Track ownership across FFI boundaries
+  - Handle allocation failures
+  - Clean up resources properly
+  ```rust
+  // ✅ DO: Proper resource management
+  pub struct UnsafeResource {
+      ptr: *mut c_void,
+  }
+
+  impl Drop for UnsafeResource {
+      fn drop(&mut self) {
+          unsafe {
+              if !self.ptr.is_null() {
+                  free_resource(self.ptr);
+              }
+          }
+      }
+  }
+  ```
+
+## Thread Safety
+
+- **Concurrent Unsafe Code**
+  - Use proper synchronization
+  - Ensure data race freedom
+  - Document thread safety requirements
+  ```rust
+  /// # Safety
+  ///
+  /// This type is `Send` because the raw pointer is only accessed
+  /// while holding the mutex guard.
+  unsafe impl Send for UnsafeShared {}
+
+  pub struct UnsafeShared {
+      inner: Mutex<*mut Data>,
+  }
+  ```

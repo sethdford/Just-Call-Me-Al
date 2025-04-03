@@ -1,0 +1,165 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# Formal Patterns Implementation
+
+## Reasoning System (Ω* = max(∇ΣΩ))
+
+```rust
+// Implementation mapping for reasoning system
+pub trait ReasoningSystem {
+    fn deductive_reasoning(&self) -> Result<Solution>;
+    fn analogical_reasoning(&self) -> Result<Solution>;
+    fn exploratory_reasoning(&self) -> Result<Solution>;
+    fn procedural_reasoning(&self) -> Result<Solution>;
+    fn contrastive_reasoning(&self) -> Result<Solution>;
+    fn skeptical_reasoning(&self) -> Result<Solution>;
+}
+
+// Hierarchical decomposition (Ω_H)
+pub trait HierarchicalDecomposition {
+    fn break_down_task(&self) -> Vec<SubTask>;
+    fn organize_units(&self) -> Vec<SolvableUnit>;
+    fn link_reasoning_modes(&self) -> HashMap<TaskId, ReasoningMode>;
+}
+```
+
+## Task Management (T = Σ(τ_complex))
+
+```rust
+pub struct TaskSystem {
+    plan_path: PathBuf,
+    backlog_path: PathBuf,
+    sprint_path: PathBuf,
+    structure: TaskStructure,
+    progress: TaskProgress,
+}
+
+impl TaskSystem {
+    pub fn update_progress(&mut self) -> Result<()> {
+        // Implementation of T.update_task_progress
+        self.locate_current_step()?;
+        self.update_status("done")?;
+        self.check_completion()?;
+        self.append_notes()?;
+        Ok(())
+    }
+}
+```
+
+## Memory Management (M = Στ(λ))
+
+```rust
+pub struct Memory<T> {
+    memory_path: PathBuf,
+    retrieval: DynamicRetrieval,
+    sync: MemorySync,
+}
+
+impl<T> Memory<T> {
+    pub fn sync(&mut self) -> Result<()> {
+        // Implementation of M.sync
+        self.store_insights()?;
+        self.store_constraints()?;
+        self.store_edge_notes()?;
+        Ok(())
+    }
+}
+```
+
+## Rule Engine (Λ = rule-based learning)
+
+```rust
+pub struct RuleEngine {
+    rules_path: PathBuf,
+    naming_convention: HashMap<String, String>,
+    pattern_alignment: PatternMatcher,
+}
+
+impl RuleEngine {
+    pub fn suggest_patterns(&self) -> Vec<Pattern> {
+        // Implementation of Λ.pattern_alignment
+        self.align_with_best_practices()
+            .filter(|p| p.is_justified())
+            .collect()
+    }
+}
+```
+
+## Diagnostic System (Ξ* = diagnostics & refinement)
+
+```rust
+pub struct DiagnosticSystem {
+    error_memory: PathBuf,
+    recurrence_threshold: u32,
+    cleanup_phase: CleanupPhase,
+}
+
+impl DiagnosticSystem {
+    pub fn track_issues(&mut self) -> Result<()> {
+        // Implementation of Ξ.track
+        self.log_recurring_issues()?;
+        self.propose_fixes()?;
+        Ok(())
+    }
+}
+```
+
+## Cognitive Trace (Ψ = cognitive trace & dialogue)
+
+```rust
+pub struct CognitiveTrace {
+    enabled: bool,
+    output_path: PathBuf,
+    dialog_enabled: bool,
+    scan_mode: ScanMode,
+}
+
+impl CognitiveTrace {
+    pub fn materialize(&self) -> Result<()> {
+        // Implementation of Ψ.materialization
+        self.generate_artifacts()?;
+        self.ensure_traceability()?;
+        Ok(())
+    }
+}
+```
+
+## Event Hooks (Σ_hooks)
+
+```rust
+pub struct EventSystem {
+    hooks: HashMap<EventType, Vec<Box<dyn Fn() -> Result<()>>>>,
+}
+
+impl EventSystem {
+    pub fn register_hooks(&mut self) {
+        self.on_task_created(vec![Box::new(|| self.memory.recall())]);
+        self.on_plan_consolidated(vec![
+            Box::new(|| self.task_system.generate_tasks()),
+            Box::new(|| self.tdd.generate_spec()),
+        ]);
+        // Additional hook registrations...
+    }
+}
+```
+
+## Implementation Guidelines
+
+1. Each mathematical construct should map to a concrete Rust implementation
+2. Use traits for abstract concepts (Ω*, Φ*, Ξ*)
+3. Use structs for concrete systems (T, M, Λ)
+4. Implement event hooks using the observer pattern
+5. Use type-safe representations of mathematical operations
+6. Maintain traceability between formal spec and code
+
+## Verification Requirements
+
+1. Each implementation must satisfy its formal specification
+2. Property-based testing for mathematical invariants
+3. Runtime verification of system constraints
+4. Formal verification where possible
+5. Documentation of mathematical mappings

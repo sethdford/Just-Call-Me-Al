@@ -1,0 +1,78 @@
+[package]
+name = "csm"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+async-trait = "0.1"
+base64 = "0.21"
+clap = { version = "4.0", features = ["derive"] }
+futures = "0.3"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+hound = "3.5"
+hyper = { version = "0.14", features = ["full"] }
+log = "0.4"
+memmap2 = "0.9.4"
+num-derive = "0.4"
+num-traits = "0.2"
+parking_lot = "0.12"
+rand = "0.8"
+rand_chacha = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+# tch: Default config for Mac dev (CPU/MPS determined by linked LibTorch)
+safetensors = "0.4.2" # Made non-optional
+tch = "0.19.0"
+# tch: Uncomment below for Production CUDA build (ensure CUDA toolkit & CUDNN installed in build env)
+# tch = { version = "0.19.0", features = ["cuda", "cudnn", "static"] }
+tempfile = "3.8"
+thiserror = "1.0"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.21"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+warp = "0.3"
+axum = { version = "0.7", features = ["ws"] }
+tokenizers = { version = "0.19", features = ["http"] }
+tower-http = { version = "0.5", features = ["fs", "trace"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+criterion = "0.5"
+quickcheck = "1.0"
+tokio-test = "0.4"
+tracing-test = "0.2"
+
+[features]
+default = [] # Removed ml - tch/safetensors are now default dependencies
+# Keep ml feature if you want the *option* to build without ML components
+# ml = ["dep:tch", "dep:safetensors"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1
+debug = true
+
+[profile.test]
+opt-level = 0
+debug = true
+
+[build-dependencies]
+cc = "1.0"
+
+[lib]
+name = "csm"
+path = "src/lib.rs"
+# You can specify crate types if needed:
+# crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "generate_eval_audio"
+path = "src/bin/generate_eval_audio.rs"
+
+

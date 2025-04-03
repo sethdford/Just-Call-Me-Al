@@ -1,0 +1,25 @@
+# Task Breakdown and Estimation
+
+1. Task Definition
+   - Each task in the issue tracker should represent a distinct piece of work.
+   - Tasks should be clearly defined with acceptance criteria.
+   - Examples: "Implement user login endpoint", "Fix button styling on profile page", "Refactor audio resampling logic".
+
+2. Granularity
+   - Break down large features or epics into smaller, manageable tasks.
+   - Aim for tasks that can ideally be completed within 1-3 days.
+   - Sub-tasks can be used for further breakdown if needed.
+
+3. Estimation
+   - Estimate the effort required for each task (e.g., using story points, ideal days, or t-shirt sizes).
+   - Estimation helps with planning and tracking progress.
+   - Be realistic and account for potential complexities or unknowns.
+   - Re-estimate if the scope or complexity changes significantly during development.
+
+4. Dependencies
+   - Identify and document dependencies between tasks.
+   - Plan work considering task dependencies.
+
+5. Assignment and Tracking
+   - Assign tasks to specific team members.
+   - Update task status regularly in the issue tracker. 

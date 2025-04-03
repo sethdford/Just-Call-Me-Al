@@ -1,0 +1,205 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# Task Tracking System
+
+## Task Context Structure
+
+```
+.cursor/
+  └── tasks/
+      ├── active/            # Currently active tasks
+      │   ├── current.json   # Current task state
+      │   └── stack.json     # Task stack for nested contexts
+      ├── sprints/           # Sprint organization
+      │   ├── current/       # Current sprint
+      │   └── archive/       # Past sprints
+      ├── backlog/           # Pending tasks
+      └── completed/         # Completed tasks with context
+```
+
+## Task State Management
+
+1. **Task Context**
+   ```rust
+   pub struct TaskContext {
+       id: TaskId,
+       title: String,
+       description: String,
+       status: TaskStatus,
+       files: Vec<FileContext>,
+       breakpoints: Vec<Breakpoint>,
+       notes: Vec<Note>,
+       created_at: DateTime<Utc>,
+       updated_at: DateTime<Utc>,
+   }
+   ```
+
+2. **File Context**
+   ```rust
+   pub struct FileContext {
+       path: PathBuf,
+       cursor_position: CursorPosition,
+       scroll_position: ScrollPosition,
+       selections: Vec<Selection>,
+       fold_states: Vec<FoldState>,
+   }
+   ```
+
+## Task Stack Management
+
+1. **Task Stack**
+   ```rust
+   pub struct TaskStack {
+       stack: Vec<TaskContext>,
+       max_size: usize,
+       
+       fn push(&mut self, context: TaskContext) {
+           // Save current context
+           // Push new context
+           // Update current.json
+       }
+       
+       fn pop(&mut self) -> Option<TaskContext> {
+           // Restore previous context
+           // Update current.json
+           // Return popped context
+       }
+   }
+   ```
+
+2. **Context Switching**
+   ```rust
+   impl TaskManager {
+       fn switch_task(&mut self, task_id: TaskId) -> Result<()> {
+           // Save current context
+           // Load new task context
+           // Update editor state
+           // Update current.json
+           Ok(())
+       }
+   }
+   ```
+
+## Progress Tracking
+
+1. **Progress State**
+   ```rust
+   pub struct TaskProgress {
+       completed_steps: Vec<TaskStep>,
+       current_step: Option<TaskStep>,
+       remaining_steps: Vec<TaskStep>,
+       blockers: Vec<Blocker>,
+       time_spent: Duration,
+   }
+   ```
+
+2. **Metrics Collection**
+   ```rust
+   pub struct TaskMetrics {
+       fn record_progress(&mut self) {
+           // Track:
+           // - Time spent
+           // - Files modified
+           // - Commits made
+           // - Tests added/modified
+       }
+   }
+   ```
+
+## Automatic Context Preservation
+
+1. **Save Triggers**
+   ```rust
+   pub struct ContextPreservation {
+       fn auto_save_context(&self) {
+           // Save on:
+           // - File switch
+           // - Task switch
+           // - Git operations
+           // - Every 2 minutes
+       }
+   }
+   ```
+
+2. **Context Restoration**
+   ```rust
+   pub struct ContextRestoration {
+       fn restore_context(&self, task_id: TaskId) -> Result<()> {
+           // Restore:
+           // - Open files
+           // - Cursor positions
+           // - Scroll positions
+           // - Terminal state
+           Ok(())
+       }
+   }
+   ```
+
+## Integration Features
+
+1. **IDE Integration**
+   ```rust
+   pub trait IDEContext {
+       fn save_ide_state(&self);
+       fn restore_ide_state(&self);
+       fn track_debugging_session(&self);
+   }
+   ```
+
+2. **VCS Integration**
+   ```rust
+   pub trait VCSContext {
+       fn save_git_context(&self);
+       fn track_branch_state(&self);
+       fn preserve_stash_context(&self);
+   }
+   ```
+
+## Task Hooks
+
+```rust
+pub struct TaskHooks {
+    on_task_start: Vec<Box<dyn Fn(&TaskContext) -> Result<()>>>,
+    on_task_pause: Vec<Box<dyn Fn(&TaskContext) -> Result<()>>>,
+    on_task_resume: Vec<Box<dyn Fn(&TaskContext) -> Result<()>>>,
+    on_task_complete: Vec<Box<dyn Fn(&TaskContext) -> Result<()>>>,
+}
+```
+
+## Best Practices
+
+1. **Context Preservation**
+   - Save full editor state on task switch
+   - Maintain task stack for nested contexts
+   - Preserve terminal history and state
+   - Track debugging breakpoints and watch expressions
+
+2. **Progress Tracking**
+   - Use atomic writes for progress updates
+   - Maintain detailed task logs
+   - Track time spent automatically
+   - Record all relevant file changes
+
+3. **Recovery Strategy**
+   - Implement automatic backups
+   - Use journaling for state changes
+   - Maintain recovery points
+   - Support context rebuild from history
+
+4. **Task Organization**
+   - Use clear task hierarchies
+   - Maintain task dependencies
+   - Track blocked/blocking relationships
+   - Support task priorities
+
+## Implementation Requirements
+
+1. Automatic state preservation
+2. Seamless context switching
+3. Robust error recovery
+4. Clear task organization
+5. Detailed progress tracking

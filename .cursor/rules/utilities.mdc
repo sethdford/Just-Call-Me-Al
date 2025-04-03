@@ -1,0 +1,23 @@
+# Utility Code Guidelines
+
+1. Location
+   - Place general-purpose utility functions and types in a dedicated `src/utils` module or similar.
+   - Group related utilities into submodules (e.g., `src/utils/tensor.rs`, `src/utils/time.rs`).
+
+2. Scope
+   - Utilities should be genuinely reusable across different parts of the application.
+   - Avoid placing domain-specific logic in the `utils` module; it should belong in the relevant domain module (e.g., `src/audio`, `src/models`).
+
+3. Simplicity and Purity
+   - Utility functions should ideally be small, focused, and pure (no side effects) where possible.
+   - Make dependencies explicit through function arguments rather than relying on global state.
+
+4. Documentation
+   - Document all public utility functions and types clearly, explaining their purpose and usage.
+   - Include examples in doctests.
+
+5. Testing
+   - Write unit tests for all utility functions, covering various inputs and edge cases.
+
+6. Naming
+   - Use clear and descriptive names that indicate the utility's function. 
