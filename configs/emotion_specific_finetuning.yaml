@@ -1,0 +1,77 @@
+# Configuration for emotion-specific fine-tuning with capability preservation
+
+# Base model to fine-tune (path to the general expressive model from previous step)
+base_model_path: "checkpoints/expressive_finetuning"
+
+# Emotions to fine-tune individual models for
+emotions:
+  - "happy"
+  - "sad"
+  - "angry"
+  - "fearful"
+  - "surprised"
+  - "neutral"
+
+# Continual learning techniques for preserving original capabilities
+# Elastic Weight Consolidation (EWC)
+use_ewc: true
+ewc_lambda: 5000.0  # Regularization strength (higher = stronger regularization)
+
+# Knowledge Distillation
+use_distillation: true
+distillation_alpha: 0.5  # Weight for distillation loss (0.0-1.0)
+temperature: 2.0  # Temperature for softening teacher outputs
+
+# Rehearsal (replay buffer of original samples)
+use_rehearsal: true
+rehearsal_buffer_size: 2000
+replay_ratio: 0.3  # Ratio of rehearsal samples to include in each batch
+
+# Parameter-efficient fine-tuning
+use_adapters: true
+adapter_r: 16  # LoRA rank for adapter modules
+
+# Training parameters
+learning_rate: 1.0e-5
+batch_size: 8
+num_epochs: 3
+grad_accumulation_steps: 2
+
+# Evaluation parameters
+eval_steps: 100  # Evaluate every N steps
+
+# Checkpointing parameters
+save_every: 500  # Save checkpoint every N steps
+
+# Output path for emotion-specific models
+output_dir: "emotion_models"
+
+# Data path (from the previous step)
+data_path: "data/combined"
+
+# Device
+device: "cuda"
+
+# Explanation of continual learning techniques for emotion fine-tuning
+# ===================================================================
+# The configuration above combines multiple techniques to prevent catastrophic forgetting
+# when fine-tuning for specific emotions:
+#
+# 1. Elastic Weight Consolidation (EWC): 
+#    Penalizes changes to important parameters from the base model.
+#    The importance is determined using Fisher information computed on general speech samples.
+#
+# 2. Knowledge Distillation:
+#    Uses the original model as a teacher to guide the emotion-specific models,
+#    ensuring they maintain the general speech capabilities while specializing for emotions.
+#
+# 3. Rehearsal:
+#    Periodically replays examples from the general dataset during fine-tuning,
+#    helping the model maintain its original capabilities.
+#
+# 4. Adapter-based Fine-tuning:
+#    Uses lightweight adapter modules (LoRA) that modify only a small subset of parameters,
+#    preserving most of the original model capabilities by design.
+#
+# These techniques work together to ensure that emotion-specific models maintain
+# high quality general speech capabilities while also expressing particular emotions effectively. 

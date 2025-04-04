@@ -70,15 +70,16 @@ impl Default for LlmConfig {
 pub fn create_service(config: LlmConfig) -> Result<Arc<dyn LlmProcessor>> {
     match config.llm_type {
         LlmType::Llama => {
-            let service = LlamaService::new(config)?;
+            let service = LlamaService::new(config.clone())?;
             Ok(Arc::new(service))
         }
         LlmType::Mistral => {
-            let service = MistralService::new(config)?;
+            let service = MistralService::new(config.clone())?;
             Ok(Arc::new(service))
         }
         LlmType::Local => {
-            if let Some(path) = &config.model_path {
+            let config_clone = config.clone();
+            if let Some(path) = &config_clone.model_path {
                 let service = LocalModelService::new(config, path)?;
                 Ok(Arc::new(service))
             } else {
@@ -86,7 +87,7 @@ pub fn create_service(config: LlmConfig) -> Result<Arc<dyn LlmProcessor>> {
             }
         }
         LlmType::Mock => {
-            let service = MockLlmService::new(config);
+            let service = MockLlmService::new(config.clone());
             Ok(Arc::new(service))
         }
     }
@@ -160,7 +161,7 @@ impl LlmProcessor for LlamaService {
         let rt = tokio::runtime::Runtime::new()?;
         
         // Generate an embedding from the context using the template
-        self.embedding_generator.generate(context, &|prompt| {
+        self.embedding_generator.generate(context, &|_prompt| {
             let prompt_str = template.format_with_history(context, self.config.max_context_window)?;
             rt.block_on(async {
                 self.generate_embedding_tensor(&prompt_str).await
@@ -278,7 +279,7 @@ impl LlmProcessor for MistralService {
         let template = self.template_registry.get_or_default(PromptType::ContextEmbedding);
         let rt = tokio::runtime::Runtime::new()?;
         
-        self.embedding_generator.generate(context, &|prompt| {
+        self.embedding_generator.generate(context, &|_prompt| {
             let prompt_str = template.format_with_history(context, self.config.max_context_window)?;
             rt.block_on(async {
                 self.generate_embedding_tensor(&prompt_str).await
@@ -389,7 +390,7 @@ impl LlmProcessor for LocalModelService {
         let template = self.template_registry.get_or_default(PromptType::ContextEmbedding);
         let rt = tokio::runtime::Runtime::new()?;
         
-        self.embedding_generator.generate(context, &|prompt| {
+        self.embedding_generator.generate(context, &|_prompt| {
             let prompt_str = template.format_with_history(context, self.config.max_context_window)?;
             rt.block_on(async {
                 self.generate_embedding_tensor(&prompt_str).await

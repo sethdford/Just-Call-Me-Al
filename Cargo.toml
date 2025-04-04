@@ -41,7 +41,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 toml = "0.8.13"
 
 # Moshi dependency (using the submodule)
-moshi = { path = "moshi/rust/moshi-core" }
+# moshi = { path = "moshi/rust/moshi-core" } # Temporarily commented out
 sentencepiece = "0.11.0"
 candle-nn = "0.8.4"
 candle-core = "0.8.4"
@@ -57,6 +57,7 @@ tracing-test = "0.2"
 default = [] # Removed ml - tch/safetensors are now default dependencies
 # Keep ml feature if you want the *option* to build without ML components
 # ml = ["dep:tch", "dep:safetensors"]
+python = []
 
 [profile.release]
 opt-level = 3

@@ -10,7 +10,15 @@ use tokio::sync::mpsc;
 // Only declare modules that have corresponding files.
 pub mod config;
 pub mod csm;
-pub mod moshi_speech_model;
+// Note: The moshi_speech_model module has been temporarily disabled
+// due to missing dependencies. The 'moshi' crate needs to be properly
+// imported or implemented to use this module. For now, we are focusing
+// on the CSM model implementation.
+// pub mod moshi_speech_model;
+
+// Test module
+#[cfg(test)]
+mod csm_tests;
 
 // Remove declarations for non-existent files:
 // pub mod attention;
@@ -26,7 +34,7 @@ pub use config::CsmModelConfig; // Example
 pub use csm::CSMImpl;      // Keep CSMImpl as the main export
 // Remove the example SafeTensor export if it's not defined
 // pub use tensor::SafeTensor; // Example
-pub use moshi_speech_model::MoshiSpeechModel;
+// pub use moshi_speech_model::MoshiSpeechModel; // Temporarily commented out
 
 // --- Error Type ---
 #[derive(Debug, thiserror::Error)]
@@ -80,6 +88,7 @@ pub trait CSMModel: Send + Sync {
     ) -> Result<Vec<i16>, ModelError>;
 
     /// Synthesize multi-codebook tokens and stream them via an MPSC channel.
+    #[allow(clippy::future_not_send)]
     async fn synthesize_streaming(
         &self,
         text: &str,

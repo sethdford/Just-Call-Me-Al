@@ -47,14 +47,29 @@ pub struct CsmModelConfig {
     pub attn_dropout: f64,      // 0.0
     // pub scale_factor: f64,   // 32.0 (Seems specific to torchtune impl, maybe not needed directly)
 
+    // LLM Integration Params
+    #[serde(default)] // Use default if not present in config.json
+    pub llm_embedding_dim: Option<i64>, // Optional dimension for incoming LLM embeddings
+
+    // Synthesis Params (add defaults as needed)
+    #[serde(default = "default_temperature")]
+    pub temperature: f64,
+    #[serde(default = "default_top_k")]
+    pub top_k: i64,
+
     // Runtime Params (can be overridden)
     #[serde(skip)]
     #[serde(default = "default_device")]
     pub device: Device,
 
     // Add other fields from config.json as needed
-    pub hidden_size: i64, // Add if present
+    pub vocab_size: i64, // Ensure this is loaded if needed
+    pub num_codebooks: i64, // Ensure this is loaded if needed (used in RustCsmModel::synthesize_streaming_internal)
 }
+
+// Helper functions for serde defaults
+fn default_temperature() -> f64 { 0.7 }
+fn default_top_k() -> i64 { 50 }
 
 impl CsmModelConfig {
     // Function to load from config.json

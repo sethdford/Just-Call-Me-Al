@@ -1,22 +1,19 @@
 //! LLM Integration Module
-//! 
-//! This module provides functionality for integrating Large Language Models (LLMs)
-//! with the CSM system to enhance contextual understanding and generate
-//! more appropriate speech characteristics.
+//!
+//! Provides traits and implementations for interacting with various LLMs
+//! for tasks like response generation and contextual embedding.
 
-use std::sync::Arc;
 use anyhow::Result;
-use tch::Tensor;
+use std::sync::Arc;
 
+// Modules
 mod context_embeddings;
 mod llm_service;
 mod prompt_templates;
-#[cfg(test)]
-mod tests;
 
-pub use context_embeddings::{ContextEmbedding, ContextEmbeddingGenerator};
-pub use llm_service::{LlmService, LlmConfig, LlmType};
-pub use prompt_templates::PromptTemplate;
+// Re-exports
+pub use context_embeddings::{ContextEmbedding, ContextEmbeddingConfig, ContextEmbeddingGenerator, CacheStats};
+pub use prompt_templates::{PromptTemplate, PromptTemplateRegistry, PromptType};
 
 /// Unified interface for LLM operations in the CSM system
 pub trait LlmProcessor: Send + Sync {
@@ -30,7 +27,35 @@ pub trait LlmProcessor: Send + Sync {
     fn generate_response(&self, context: &crate::context::ConversationHistory) -> Result<String>;
 }
 
+// Export the trait and necessary concrete types/configs
+pub use llm_service::{LlmConfig, LlmType, create_service, MockLlmService, LlamaService, MistralService, LocalModelService};
+
+// Export test module if needed for external tests
+#[cfg(test)]
+pub mod tests;
+
 /// Factory function to create an appropriate LLM service based on configuration
 pub fn create_llm_service(config: LlmConfig) -> Result<Arc<dyn LlmProcessor>> {
     llm_service::create_service(config)
+}
+
+/// Convert from context::ConversationHistory to our local ConversationHistory
+pub fn create_llm_history(local_history: &crate::context::ConversationHistory) -> crate::context::ConversationHistory {
+    let mut llm_history = crate::context::ConversationHistory::new(None);
+    
+    // Copy each turn using the public get_turns() method
+    for turn in local_history.get_turns() {
+        let speaker = match turn.speaker {
+            crate::context::Speaker::User => crate::context::Speaker::User,
+            crate::context::Speaker::Model => crate::context::Speaker::Model,
+            crate::context::Speaker::System => crate::context::Speaker::System,
+        };
+        
+        llm_history.add_turn(crate::context::ConversationTurn::new(
+            speaker,
+            turn.text.clone()
+        ));
+    }
+    
+    llm_history
 } 

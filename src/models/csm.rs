@@ -1,23 +1,30 @@
 use std::path::Path;
+use std::sync::Arc;
+use std::collections::HashMap;
+use std::fs::File;
+
+// External crates
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use memmap2::MmapOptions;
+use serde::Deserialize;
+use tracing::{debug, error, info, warn};
+
+// tch related
 use tch::{Device, Tensor, Kind, TchError, nn};
+use tch::nn::Module;
+
+// tokio related
+use tokio::sync::{mpsc, Mutex as TokioMutex};
+
+// Internal imports
 use crate::models::{CSMModel, ModelError};
 use crate::models::config::CsmModelConfig;
-use tokenizers::Tokenizer;
-use async_trait::async_trait;
-use safetensors::SafeTensors;
-use safetensors::tensor::TensorView;
-use std::sync::Arc;
-use tch::nn::Module;
-use std::collections::HashMap;
-use tokio::sync::mpsc;
-use tracing::{info, warn, error, debug};
-use std::fs::File;
-use memmap2::MmapOptions;
-use tokio::sync::Mutex as TokioMutex;
-use anyhow::Result;
-use serde::Deserialize;
-use crate::vocoder::Vocoder; // Import the Vocoder trait if needed for decode
-use crate::vocoder::MimiVocoder; // Add MimiVocoder import
+use crate::vocoder::{Vocoder, MimiVocoder};
+use crate::llm_integration::{LlmProcessor, ContextEmbedding, LlmConfig, create_llm_service};
+use crate::context::ConversationHistory;
+use crate::tokenization::{Tokenizer, LlamaTokenizer};
+use safetensors::{SafeTensors, tensor::TensorView};
 
 const EOS_TOKEN_ID: i64 = 2; // Assuming standard EOS token ID for SentencePiece/Llama
 
@@ -275,95 +282,80 @@ pub struct CSMImpl {
 }
 
 impl CSMImpl {
+    // Original new function (kept for compatibility or internal use if needed)
     pub fn new(model_dir: &Path, device: Device) -> Result<Self, ModelError> {
-        info!("Initializing CSMImpl Wrapper for model dir: {:?} and device: {:?}", model_dir, device);
-
-        let rust_model_instance = RustCsmModel::new(model_dir, device, None)?;
+        info!("Initializing CSMImpl Wrapper (basic) for model dir: {:?} and device: {:?}", model_dir, device);
+        // Create default LLM service if none supplied
+        let default_llm_config = LlmConfig::default();
+        let default_llm_processor = create_llm_service(default_llm_config)
+            .map_err(|e| ModelError::Other(anyhow!("Failed to create default LLM service: {}", e)))?;
+        let rust_model_instance = RustCsmModel::new(model_dir, device, None, default_llm_processor)?;
 
         // Wrap in Mutex then Arc
-        let rust_model_arc = Arc::new(TokioMutex::new(rust_model_instance));
+        let model_mutex = TokioMutex::new(rust_model_instance);
+        let model_arc = Arc::new(model_mutex);
 
-        Ok(Self {
-            rust_model: rust_model_arc,
-        })
+        Ok(Self { rust_model: model_arc })
+    }
+    
+    // New function to accept an LLM processor
+    pub fn new_with_processor(
+        model_dir: &Path, 
+        device: Device, 
+        llm_processor: Arc<dyn LlmProcessor>
+    ) -> Result<Self, ModelError> {
+        info!("Initializing CSMImpl Wrapper with LLM Processor for model dir: {:?} and device: {:?}", model_dir, device);
+        let rust_model_instance = RustCsmModel::new(model_dir, device, None, llm_processor)?;
+
+        // Wrap in Mutex then Arc
+        let model_mutex = TokioMutex::new(rust_model_instance);
+        let model_arc = Arc::new(model_mutex);
+
+        Ok(Self { rust_model: model_arc })
     }
 }
 
 // --- CSMModel Trait Implementation for CSMImpl ---
 #[async_trait]
 impl CSMModel for CSMImpl {
-    // Update return type to i16
+    // Correct signature: Match the trait (remove conversation_history)
     async fn synthesize(
         &self,
         text: &str,
+        // conversation_history: Option<&ConversationHistory>, // REMOVED
         temperature: Option<f64>,
         top_k: Option<i64>,
         seed: Option<u64>,
     ) -> Result<Vec<i16>, ModelError> {
-        info!("Synthesizing non-streamed audio for: {}", text);
-        let (audio_token_tx, mut audio_token_rx) = mpsc::channel(100);
-
-        let model_clone = self.rust_model.clone();
-        let text_owned = text.to_string();
-        // Clone individual params
-        let temp_clone = temperature;
-        let topk_clone = top_k;
-        let seed_clone = seed;
-
-        let synthesis_handle = tokio::spawn(async move {
-            let mut model_guard = model_clone.lock().await;
-            // Pass individual params to internal method
-            model_guard.synthesize_streaming_internal(
-                &text_owned,
-                temp_clone,
-                topk_clone,
-                seed_clone,
-                audio_token_tx,
-            ).await
-        });
-
-        let mut all_token_chunks: Vec<Vec<(i64, Vec<i64>)>> = Vec::new();
-        while let Some(tokens) = audio_token_rx.recv().await {
-             if !tokens.is_empty() {
-                 all_token_chunks.push(tokens);
-             }
-        }
-
-        match synthesis_handle.await {
-            Ok(Ok(())) => info!("Synthesis task completed successfully."),
-            Ok(Err(e)) => return Err(e),
-            Err(join_err) => return Err(ModelError::ProcessError(format!("Task join error: {}", join_err))),
-        }
-
-        if all_token_chunks.is_empty() { return Ok(Vec::new()); }
-        info!("Collected {} RVQ token chunks.", all_token_chunks.len());
-
-        info!("Starting vocoding...");
-        let model_guard = self.rust_model.lock().await;
-        let audio_samples = model_guard.vocoder.decode_tokens(all_token_chunks).await?;
-        info!("Vocoding complete. Generated {} audio samples.", audio_samples.len());
-        Ok(audio_samples)
+        let mut model_guard = self.rust_model.lock().await; // Acquire lock
+        // Call the internal method - must be updated to match
+        // For now, assume internal method is also updated (or call a different one)
+        // We need to decide how non-streaming synthesis should handle history.
+        // Option 1: Error if history is implicitly needed but not provided.
+        // Option 2: Call internal method without history (None).
+        // Let's go with Option 2 for now, but mark it for review.
+        warn!("Non-streaming synthesize called; conversation history is ignored in this path.");
+        model_guard.synthesize(text, None, temperature, top_k, seed).await // Pass None for history
     }
 
-    // Revert signature to use individual params
+    // Correct signature: Match the trait (remove conversation_history)
+    #[allow(clippy::future_not_send)]
     async fn synthesize_streaming(
         &self,
         text: &str,
+        // conversation_history: Option<&ConversationHistory>, // REMOVED
         temperature: Option<f64>,
         top_k: Option<i64>,
         seed: Option<u64>,
-        audio_token_tx: mpsc::Sender<Vec<(i64, Vec<i64>)>>, // Correct channel type
+        audio_token_tx: mpsc::Sender<Vec<(i64, Vec<i64>)>>, // Match trait signature
     ) -> Result<(), ModelError> {
-        info!("Calling internal streaming synthesis for: {}", text);
-        let mut model_guard = self.rust_model.lock().await;
-        // Delegate directly, passing individual params
-        model_guard.synthesize_streaming_internal(
-            text,
-            temperature,
-            top_k,
-            seed,
-            audio_token_tx,
-        ).await
+        let mut model_guard = self.rust_model.lock().await; // Acquire lock
+        // Call the internal method - this one needs history, where does it come from?
+        // The trait doesn't provide it. This indicates a design mismatch.
+        // For now, let's pass None, but this needs resolution.
+        // TODO: Resolve how streaming synthesis gets conversation history via trait.
+        warn!("Streaming synthesize called via trait; conversation history is currently unavailable in this path.");
+        model_guard.synthesize_streaming(text, None, temperature, top_k, seed, audio_token_tx).await // Pass None for history
     }
 }
 
@@ -577,15 +569,12 @@ fn apply_rotary_pos_emb(q: &Tensor, k: &Tensor, cos: &Tensor, sin: &Tensor) -> R
 
 fn rotate_half(x: &Tensor) -> Result<Tensor, TchError> {
     // Get the last dimension size
-    let last_dim = match x.size().last() {
-        Some(&dim) => dim,
-        None => return Err(TchError::Kind("Tensor has no dimensions".to_string())),
-    };
-    let half_dim = last_dim / 2;
+    let size = x.size();
+    let last_dim = size.last().unwrap_or(&0);
     
     // Slice along the last dimension (-1)
-    let x1 = x.slice(-1, 0, half_dim, 1);
-    let x2 = x.slice(-1, half_dim, last_dim, 1);
+    let x1 = x.slice(-1, 0, size[size.len() - 1] / 2, 1);
+    let x2 = x.slice(-1, size[size.len() - 1] / 2, size[size.len() - 1], 1);
     
     // Concatenate along the last dimension
     Ok(Tensor::cat(&[-x2, x1], -1))
@@ -785,50 +774,54 @@ impl TransformerBlock {
         cache: &mut AttentionCache,
         conditioning_embedding: Option<&Tensor>
     ) -> Result<Tensor, TchError> {
-        // Keep input shape log at info for now
-        info!("  TransformerBlock input shape: {:?}", xs.size());
-
+        // Residual connection start
         let residual = xs;
-
-        let (gamma_attn, beta_attn) = match conditioning_embedding {
-            Some(cond_emb) => {
-                let gamma = self.attn_gamma_proj.forward(cond_emb);
-                let beta = self.attn_beta_proj.forward(cond_emb);
-                (Some(gamma), Some(beta))
-            }
-            None => (None, None),
-        };
         
-        let normed_xs_attn = self.attn_norm.forward(xs, gamma_attn.as_ref(), beta_attn.as_ref())?;
-
-        // Change intermediate shape logs to debug
-        debug!("    Normed for Attn shape: {:?}", normed_xs_attn.size());
-        let attn_output = self.attn.forward(&normed_xs_attn, start_pos, mask, cache)?;
-        debug!("    Attn output shape: {:?}", attn_output.size());
-        let h = residual.f_add(&attn_output)?;
-        debug!("    After Attn Add shape: {:?}", h.size());
-
-        let residual_ffn = &h;
+        // --- Apply Conditioning (Additive Bias Example) --- 
+        let mut h = xs.copy(); // Copy to modify
+        if let Some(cond_emb) = conditioning_embedding {
+             // Ensure embedding matches sequence dimension or broadcast
+             // Assuming cond_emb is [B, 1, D] or [B, S, D] and xs is [B, S, D]
+             // Simple addition might require broadcasting cond_emb from [B, 1, D] to [B, S, D]
+             // Placeholder: Directly add if dimensions allow, otherwise log warning.
+             // This needs refinement based on actual embedding preparation.
+             let size = h.size();
+             let last_dim = size.last().unwrap_or(&0);
+             // Cast to match types for comparison
+             if cond_emb.dim() as i64 == *last_dim {
+                 h = &h + cond_emb;
+                 debug!("Added conditioning embedding directly.");
+             } else if cond_emb.dim() as i64 == 1 { // Check if broadcast is possible
+                 h = &h + cond_emb;
+                 debug!("Added conditioning embedding via broadcasting.");
+             } else {
+                 warn!("Conditioning embedding seq_len ({}) doesn't match input seq_len ({}) and is not 1. Skipping addition.", cond_emb.dim(), h.dim());
+             }
+         }
+        // --------------------------------------------------
         
-        let (ffn_gamma, ffn_beta) = match conditioning_embedding {
-            Some(cond_emb) => {
-                let gamma = self.ffn_gamma_proj.forward(cond_emb);
-                let beta = self.ffn_beta_proj.forward(cond_emb);
-                (Some(gamma), Some(beta))
-            }
-            None => (None, None),
-        };
-
-        let normed_h_ffn = self.ffn_norm.forward(&h, ffn_gamma.as_ref(), ffn_beta.as_ref())?; 
-
-        // Change intermediate shape logs to debug
-        debug!("    Normed for FFN shape: {:?}", normed_h_ffn.size());
-        let ffn_output = self.ffn.forward(&normed_h_ffn)?;
-        debug!("    FFN output shape: {:?}", ffn_output.size());
-        let final_output = residual_ffn.f_add(&ffn_output)?;
-        // Keep output shape log at info for now
-        info!("  TransformerBlock output shape: {:?}", final_output.size()); 
-        Ok(final_output)
+        // Apply attention norm with conditioning
+        let attn_norm_gamma = self.attn_gamma_proj.forward(&h);
+        let attn_norm_beta = self.attn_beta_proj.forward(&h);
+        let h_norm = self.attn_norm.forward(&h, Some(&attn_norm_gamma), Some(&attn_norm_beta))?;
+        
+        // Self-attention
+        let attn_output = self.attn.forward(&h_norm, start_pos, mask, cache)?;
+        
+        // First residual connection
+        h = residual + attn_output;
+        
+        // Feed-forward part
+        let ffn_input = &h; // Input for FFN norm
+        let ffn_norm_gamma = self.ffn_gamma_proj.forward(ffn_input);
+        let ffn_norm_beta = self.ffn_beta_proj.forward(ffn_input);
+        let h_norm = self.ffn_norm.forward(ffn_input, Some(&ffn_norm_gamma), Some(&ffn_norm_beta))?;
+        let ffn_output = self.ffn.forward(&h_norm)?;
+        
+        // Second residual connection
+        let output = &h + ffn_output;
+        
+        Ok(output)
     }
 }
 
@@ -884,39 +877,28 @@ impl LlamaTransformer {
         start_pos: usize, 
         mask: Option<&Tensor>, 
         cache: &mut TransformerCache,
-        conditioning_embedding: Option<&Tensor>
+        conditioning_embedding: Option<&Tensor> // Parameter already exists
     ) -> Result<Tensor, TchError> {
-        // Change top-level forward entry to debug
-        debug!("Shape entering Llama::forward: {:?}", xs.size()); 
-        let mut current_xs = xs.copy();
-        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-             let layer_cache = cache.layer_caches.get_mut(layer_idx)
-                 .ok_or(TchError::FileFormat(format!("Layer cache index {} out of bounds", layer_idx)))?;
-             current_xs = layer.forward(&current_xs, start_pos, mask, layer_cache, conditioning_embedding)?;
-        }
-
-        // Determine gamma and beta for the final norm
-        let (gamma_final, beta_final) = match conditioning_embedding {
-            Some(cond_emb) => {
-                // Project the provided conditioning embedding
-                let gamma = self.final_gamma_proj.forward(cond_emb);
-                let beta = self.final_beta_proj.forward(cond_emb);
-                // Unsqueeze to match target shape [B, 1, D]
-                (gamma.unsqueeze(1), beta.unsqueeze(1)) 
-            }
-            None => {
-                // Keep this info log as it's important
-                info!("No conditioning embedding provided, using default final norm values."); 
-                let (_b_sz, _seq_len, embed_dim) = current_xs.size3()?; // Get embed_dim from current tensor
-                let default_gamma = Tensor::ones(&[1, 1, embed_dim], (Kind::Float, xs.device())); // Shape [1, 1, D]
-                let default_beta = Tensor::zeros(&[1, 1, embed_dim], (Kind::Float, xs.device())); // Shape [1, 1, D]
-                // These will broadcast correctly to [B, S, D]
-                (default_gamma, default_beta)
-            }
-        };
+        let mut h = xs.copy(); // Copy input to allow mutation
         
-        // Apply the final norm using either projected or default gamma/beta
-        self.norm.forward(&current_xs, Some(&gamma_final), Some(&beta_final))
+        if cache.layer_caches.len() != self.layers.len() {
+             return Err(TchError::Shape(format!(
+                 "Cache layers ({}) do not match transformer layers ({})",
+                 cache.layer_caches.len(),
+                 self.layers.len()
+             )));
+         }
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let layer_cache = &mut cache.layer_caches[i];
+            
+            // --- Pass conditioning_embedding down to the block --- 
+            h = layer.forward(&h, start_pos, mask, layer_cache, conditioning_embedding)?;
+            // ----------------------------------------------------
+        }
+        
+        // Final normalization is handled outside this transformer block
+        Ok(h)
     }
 }
 
@@ -924,103 +906,143 @@ impl LlamaTransformer {
 #[derive(Debug)]
 struct CsmBackbone {
     text_embeddings: nn::Embedding,
+    // TODO: Add audio embeddings if multimodal
     transformer: LlamaTransformer,
+    // TODO: Add semantic head projection
+    // semantic_head: nn::Linear,
+    // ADDED: Projection layer for context embeddings
+    context_projection: Option<nn::Linear>,
 }
 
 impl CsmBackbone {
     fn new(vs: &nn::Path, config: &CsmModelConfig) -> Result<Self, TchError> {
-        // Explicitly set the vocabulary size to include the new control tokens
-        let effective_vocab_size = 128261; // Original size + 5 control tokens
-        info!("Initializing CsmBackbone text embeddings with effective vocab size: {}", effective_vocab_size);
-
+        // Fix 1: Remove '?' as nn::embedding likely doesn't return Result anymore
+        // Fix 2: Replace .pp() with /
         let text_embeddings = nn::embedding(
-            vs / "text_embeddings",
-            effective_vocab_size, // Use the new size here
-            config.backbone_embed_dim,
+            vs / "text_embeddings", // Changed from vs.pp(...)
+            config.vocab_size as i64,
+            config.backbone_embed_dim, // Changed from config.backbone_dim
             Default::default()
-        );
-        let transformer = LlamaTransformer::new(&(vs / "backbone"), config, true)?;
+        ); // Removed '?'
+
+        // Fix 2: Replace .pp() with /
+        // Fix 1: Remove '?' as LlamaTransformer::new might not return Result or handles errors internally
+        let transformer = LlamaTransformer::new(&(vs / "transformer"), config, true)?; // Keep '?' for now, assuming constructor might fail
+
+        // Initialize context projection layer if embedding dim is configured and differs
+        let context_projection = if let Some(llm_embed_dim) = config.llm_embedding_dim {
+             // Fix 3: Use backbone_embed_dim
+             if llm_embed_dim != config.backbone_embed_dim {
+                 info!("Creating projection layer for context embedding: {} -> {}", llm_embed_dim, config.backbone_embed_dim);
+                 // Fix 1 & 2: Remove '?' and use /
+                 Some(nn::linear(vs / "context_projection", llm_embed_dim, config.backbone_embed_dim, Default::default())) // Removed '?'
+             } else {
+                 info!("Context embedding dimension matches backbone dimension. No projection needed.");
+                 None
+             }
+         } else {
+             info!("LLM embedding dimension not configured. No projection layer created.");
+             None
+         };
+
         Ok(Self {
             text_embeddings,
             transformer,
+            context_projection,
         })
     }
 
-    // Corrected forward method signature to accept config
     fn forward(
-        &mut self, 
-        text_tokens: &Tensor, 
-        start_pos: usize, 
-        mask: Option<&Tensor>, 
+        &mut self,
+        text_tokens: &Tensor,
+        start_pos: usize,
+        _mask: Option<&Tensor>, // Marked unused for now, recalculate below
         cache: &mut TransformerCache,
-        config: &CsmModelConfig // ADDED config parameter
+        config: &CsmModelConfig,
+        context_embedding: Option<&ContextEmbedding> // ADDED context embedding param
     ) -> Result<(Tensor, Tensor), TchError> // Return tuple (hidden_states, semantic_logits)
     {
-        // --- Calculate Conditioning Embedding --- 
-        // Identify control token IDs (assuming they are >= 128256 based on vocab size)
-        let control_token_mask = text_tokens.ge(128256i64);
-        
-        let conditioning_embedding = if control_token_mask.any().int64_value(&[]) == 1 {
-            // Get embeddings for control tokens only
-            // We need to select the embeddings corresponding to the control tokens.
-            // This is tricky with indexing. A simpler approach is to average *all* token embeddings
-            // where the mask is true, or just use the embedding of the *last* control token.
-            
-            // Strategy: Use the embedding of the LAST control token in the sequence.
-            let (batch_size, _seq_len) = text_tokens.size2()?;
-            let mut last_control_token_embeddings = Vec::with_capacity(batch_size as usize);
-            let mut found_any_control = false;
+        let (batch_size, seq_len) = text_tokens.size2()?;
+        let device = text_tokens.device(); // Fix 5: Get device from input tensor
 
-            for b in 0..batch_size {
-                let batch_tokens = text_tokens.select(0, b);
-                let batch_mask = control_token_mask.select(0, b);
-                let control_indices = batch_mask.nonzero().squeeze_dim(-1);
+        if start_pos > 0 && cache.layer_caches[0].kv.is_none() {
+             warn!("Using start_pos > 0 but cache is empty. This might be inefficient or incorrect.");
+        }
 
-                if control_indices.numel() > 0 {
-                    let last_control_index = control_indices.select(0, -1); // Get the last index
-                    let last_control_token_id = batch_tokens.index_select(0, &last_control_index);
-                    let emb = self.text_embeddings.forward(&last_control_token_id);
-                    last_control_token_embeddings.push(emb);
-                    found_any_control = true;
+        // 1. Get text embeddings
+        // Fix 1: Remove '?' from forward call
+        let txt_embeddings = self.text_embeddings.forward(text_tokens);
+        let mut h = txt_embeddings;
+
+        // --- Project and Prepare Context Embedding --- 
+        let conditioning_tensor = if let Some(embedding) = context_embedding {
+            let projected_embedding = if let Some(proj_layer) = &self.context_projection {
+                 debug!("Projecting context embedding...");
+                 proj_layer.forward(&embedding.tensor)
+             } else {
+                 // Check if dimensions match if no projection layer exists
+                 let size = h.size();
+                 let last_dim = size.last().unwrap_or(&0);
+                 // Cast to match types for comparison
+                 if embedding.dim() as i64 == *last_dim {
+                     embedding.tensor.copy() // Copy if dims match and no projection needed
+                 } else {
+                     warn!(
+                         "Context embedding dim ({}) doesn't match hidden dim ({}) and no projection layer exists. Skipping backbone conditioning.", 
+                         embedding.dim(), last_dim
+                     );
+                     return Err(TchError::Kind("Context embedding dimensions don't match and no projection layer exists".to_string()));
+                 }
+             };
+             
+             // Ensure the projected embedding can be broadcast/added (e.g., shape [B, 1, D])
+             projected_embedding.unsqueeze(0).unsqueeze(0) // Assuming original embedding is [D], make it [1, 1, D]
+             // Note: Adjust unsqueezing based on actual embedding tensor shape from LLM
+
         } else {
-                    // Use the passed config parameter here, NOT self.config
-                    let default_emb = Tensor::zeros(&[1, config.backbone_embed_dim], (Kind::Float, config.device));
-                    last_control_token_embeddings.push(default_emb);
-                }
-            }
-            
-            if found_any_control {
-                // Stack embeddings from each batch item: Vec<[1, D]> -> [B, D]
-                Some(Tensor::cat(&last_control_token_embeddings, 0))
-            } else {
-                // No control tokens found in any batch item
-                None
-            }
-        } else {
-            // No control tokens in the input
-            None
+             return Err(TchError::Kind("No context embedding provided".to_string()));
         };
-        // ------------------------------------------
+        // ---------------------------------------------
         
-        let initial_embeddings = self.text_embeddings.forward(text_tokens);
-        
-        // Pass conditioning embedding to the transformer and handle Result explicitly
-        let transformer_result = self.transformer.forward(
-            &initial_embeddings, 
+        // 2. Create Causal Mask if needed
+        // Fix 6: Adjust mask creation logic
+        let mask_tensor; // Declare mask tensor variable
+        let mask = if seq_len <= 1 {
+             None
+         } else {
+             match create_causal_mask(seq_len, device) { // Fix 5: Use device obtained earlier
+                 Ok(m) => {
+                     mask_tensor = m; // Assign to the declared variable
+                     Some(&mask_tensor) // Return a reference
+                 }
+                 Err(e) => {
+                     error!("Failed to create causal mask: {}", e);
+                     None
+                 }
+             }
+         };
+
+        // 3. Pass through transformer layers
+        // Note: Still potentially ambiguous 'forward' call - Fix 7 pending
+        h = self.transformer.forward(
+            &h, 
             start_pos, 
             mask, 
             cache,
-            conditioning_embedding.as_ref() // Pass Option<&Tensor>
-        );
+            Some(conditioning_tensor.as_ref()) // Wrap in Some() to create Option<&Tensor>
+        )?;
 
-        let hidden_states = match transformer_result {
-            Ok(hs) => hs,
-            Err(e) => return Err(e), // Propagate error
-        };
-        
-        let semantic_logits = hidden_states.copy(); // Or apply a projection head if needed
+        // 4. Final normalization
+        // Fix 1: Remove '?' from forward calls
+        let final_norm_gamma = self.transformer.final_gamma_proj.forward(&h);
+        let final_norm_beta = self.transformer.final_beta_proj.forward(&h);
+        let backbone_hidden_states = self.transformer.norm.forward(&h, Some(&final_norm_gamma), Some(&final_norm_beta))?; // Keep '?' for norm
 
-        Ok((hidden_states, semantic_logits)) 
+        let vocab_size = config.vocab_size as i64;
+        // Fix 5: Use device obtained earlier
+        let semantic_logits = Tensor::zeros(&[batch_size, seq_len, vocab_size], (Kind::Float, device));
+
+        Ok((backbone_hidden_states, semantic_logits))
     }
 }
 
@@ -1028,37 +1050,45 @@ impl CsmBackbone {
 #[derive(Debug)]
 struct CsmDecoder {
     config: CsmModelConfig,
-    audio_embeddings: nn::Embedding, 
+    audio_embeddings: nn::Embedding,
     transformer: LlamaTransformer,
     projection: nn::Linear,
-    codebook_heads: Vec<nn::Linear>, 
+    codebook_heads: Vec<nn::Linear>,
 }
 
 impl CsmDecoder {
     fn new(vs: &nn::Path, config: &CsmModelConfig) -> Result<Self, TchError> {
+        // Fix 1: Remove '?'
         let audio_embeddings = nn::embedding(
             vs / "audio_embeddings",
-            config.acoustic_vocab_size * config.num_acoustic_codebooks,
+            config.acoustic_vocab_size * config.num_acoustic_codebooks, // Assuming these are i64
             config.decoder_embed_dim,
             Default::default()
-        );
-        let transformer = LlamaTransformer::new(&(vs / "decoder"), config, false)?;
+        ); // Removed '?'
+
+        let transformer = LlamaTransformer::new(&(vs / "decoder"), config, false)?; // Keep '?'
+
+        // Fix 1: Remove '?'
         let projection = nn::linear(
             vs / "projection",
-            config.backbone_embed_dim,
+            config.backbone_embed_dim, // Assuming this is correct
             config.decoder_embed_dim,
             Default::default()
-        );
+        ); // Removed '?'
 
-        let mut codebook_heads = Vec::with_capacity(config.num_acoustic_codebooks as usize);
+        // Fix 8: Convert i64 to usize for capacity
+        let num_codebooks_usize = config.num_acoustic_codebooks.try_into().map_err(|e| TchError::Convert(format!("Invalid num_acoustic_codebooks: {}", e)))?;
+        let mut codebook_heads = Vec::with_capacity(num_codebooks_usize);
+
         for i in 0..config.num_acoustic_codebooks {
             let head_name = format!("acoustic_head_{}", i);
+            // Fix 1: Remove '?'
             let head = nn::linear(
                 vs / &head_name,
                 config.decoder_embed_dim,
-                config.acoustic_vocab_size,
+                config.acoustic_vocab_size, // Assuming i64
                 Default::default()
-            );
+            ); // Removed '?'
             codebook_heads.push(head);
         }
 
@@ -1071,75 +1101,81 @@ impl CsmDecoder {
         })
     }
 
-    // Corrected forward signature to accept _conditioning_embedding
-    fn forward(
-        &mut self, 
-        backbone_output: &Tensor, 
-        prev_acoustic_tokens_embedded: &Tensor, 
-        start_pos: usize,
-        mask: Option<&Tensor>, 
-        cache: &mut TransformerCache,
-        _conditioning_embedding: Option<&Tensor> // Add unused 5th arg 
-    ) -> Result<Vec<Tensor>, TchError> // Returns Vec of acoustic logits
-    {
-        let projected_backbone = self.projection.forward(backbone_output);
-        let decoder_input = projected_backbone.f_add(prev_acoustic_tokens_embedded)?;
-        
-        // Pass None for conditioning_embedding to the decoder's transformer
-        let hidden_states = self.transformer.forward(
-            &decoder_input, 
-            start_pos, 
-            mask, 
-            cache,
-            None // Decoder is not conditioned for now
-        )?;
-
-        // Calculate logits ONLY for acoustic heads
-        let mut acoustic_logits = Vec::with_capacity(self.config.num_acoustic_codebooks as usize);
-        for head in &self.codebook_heads { // Iterate over acoustic heads
-            acoustic_logits.push(head.forward(&hidden_states));
-        }
-        Ok(acoustic_logits)
-    }
-
-    // embed_audio and embed_audio_timestep handle acoustic tokens and remain correct
+    // Re-add embed_audio method
     fn embed_audio(&self, codebook_idx: i64, tokens: &Tensor) -> Result<Tensor, TchError> {
         let acoustic_vocab_size = self.config.acoustic_vocab_size;
         let offset = codebook_idx * acoustic_vocab_size;
         let offset_tokens = tokens + offset;
-        Ok(self.audio_embeddings.forward(&offset_tokens.to_device(self.config.device)))
+        // Ensure tensor is on the correct device
+        Ok(self.audio_embeddings.forward(&offset_tokens.to_device(self.audio_embeddings.ws.device())))
     }
 
-    fn embed_audio_timestep(&self, audio_tokens_step: &[i64]) -> Result<Tensor, ModelError> {
-        if audio_tokens_step.len() != self.config.num_acoustic_codebooks as usize {
-            return Err(ModelError::InvalidInput(format!(
-                "Expected {} acoustic tokens, got {}",
-                self.config.num_acoustic_codebooks,
-                audio_tokens_step.len()
-            )));
+    // Corrected forward signature to accept _conditioning_embedding
+    fn forward(
+        &mut self,
+        backbone_output: &Tensor,
+        prev_acoustic_tokens_embedded: &Tensor,
+        start_pos: usize,
+        mask: Option<&Tensor>,
+        cache: &mut TransformerCache,
+        conditioning_embedding: Option<&Tensor> // Pass embedding TENSOR if available
+    ) -> Result<Vec<Tensor>, TchError> // Returns Vec of acoustic logits
+    {
+        // Combine backbone output with previous acoustic embeddings
+        // Fix 1: Remove '?' from tensor addition (likely panics on error)
+        let decoder_input = backbone_output + prev_acoustic_tokens_embedded;
+
+        // Pass through decoder transformer layers
+        // Note: Still potentially ambiguous 'forward' call - Fix 7 pending
+        let transformer_output = self.transformer.forward(
+            &decoder_input,
+            start_pos,
+            mask,
+            cache,
+            conditioning_embedding // Pass conditioning embedding down
+        )?;
+
+        // Project to acoustic logits
+        // Fix 1: Remove '?' from forward call
+        let projected_output = self.projection.forward(&transformer_output);
+
+        // Fix 8 requires capacity check already done in `new`
+        let mut acoustic_logits = Vec::with_capacity(self.codebook_heads.len());
+        for head in &self.codebook_heads {
+            // Fix 1: Remove '?' from forward call
+            acoustic_logits.push(head.forward(&projected_output));
         }
-        let mut summed_embedding: Option<Tensor> = None;
-        for (codebook_idx, &token_id) in audio_tokens_step.iter().enumerate() {
-            let token_tensor = Tensor::from_slice(&[token_id]).to_kind(Kind::Int64).to_device(self.config.device);
-            let embedding = self.embed_audio(codebook_idx as i64, &token_tensor)?;
-            if let Some(sum) = summed_embedding {
-                summed_embedding = Some(sum.f_add(&embedding)?);
-            } else {
-                summed_embedding = Some(embedding);
-            }
-        }
-        summed_embedding.ok_or_else(|| ModelError::ProcessError("Failed to sum acoustic audio embeddings".to_string()))
+
+        // Now we can safely return the tokens without any further await points
+        Ok(acoustic_logits)
     }
 }
 
-#[derive(Debug)]
+// Remove Debug derive and implement it manually to skip llm_processor
+// #[derive(Debug)]
 pub struct RustCsmModel {
     config: CsmModelConfig,
     backbone: CsmBackbone,
     decoder: CsmDecoder,
-    tokenizer: Tokenizer,
+    tokenizer: Box<dyn Tokenizer>,
     device: Device,
     vocoder: Box<dyn Vocoder>, // Assuming Vocoder trait
+    llm_processor: Arc<dyn LlmProcessor>, // Add LLM processor
+}
+
+// Manually implement Debug to exclude llm_processor
+impl std::fmt::Debug for RustCsmModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RustCsmModel")
+         .field("config", &self.config)
+         .field("backbone", &self.backbone) // Assuming CsmBackbone implements Debug
+         .field("decoder", &self.decoder)   // Assuming CsmDecoder implements Debug
+         .field("tokenizer", &"<Tokenizer>") // Placeholder for tokenizer
+         .field("device", &self.device)
+         .field("vocoder", &"<Vocoder>")     // Placeholder for vocoder
+         .field("llm_processor", &"<LlmProcessor>") // Indicate presence without debugging
+         .finish()
+    }
 }
 
 // SAFETY: Mark Send + Sync as layers hold Tensors
@@ -1151,6 +1187,7 @@ impl RustCsmModel {
         model_dir: &Path,
         device: Device,
         _seed: Option<u64>,
+        llm_processor: Arc<dyn LlmProcessor>, // Add llm_processor parameter
     ) -> Result<Self, ModelError> {
         let config_path = model_dir.join("config.json");
         let mut config = CsmModelConfig::from_file(&config_path)?;
@@ -1190,8 +1227,18 @@ impl RustCsmModel {
         };
         // -------------------------------------
 
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| ModelError::TokenizationError(format!("Failed to load tokenizer: {}", e)))?;
+        // Use Box<dyn Tokenizer> with LlamaTokenizer created from config
+        let tokenizer_config = crate::tokenization::TokenizerConfig {
+            vocab_path: tokenizer_path.to_string_lossy().to_string(),
+            max_length: 2048,
+            add_special_tokens: true,
+            cache_size: 10000,
+        };
+        
+        let tokenizer: Box<dyn Tokenizer> = Box::new(
+            LlamaTokenizer::new(tokenizer_config)
+                .map_err(|e| ModelError::TokenizationError(format!("Failed to load tokenizer: {}", e)))?
+        );
 
         // Create and initialize the vocoder
         let mut vocoder_impl = MimiVocoder::new(24000, device)?;
@@ -1206,137 +1253,259 @@ impl RustCsmModel {
             tokenizer,
             device,
             vocoder,
+            llm_processor, // Store the passed LLM processor
         })
     }
 
-    async fn synthesize_streaming_internal(
+    pub async fn synthesize_streaming_internal(
         &mut self,
         text: &str,
+        conversation_history: Option<&ConversationHistory>,
         temperature: Option<f64>,
         top_k: Option<i64>,
         seed: Option<u64>,
         audio_token_tx: mpsc::Sender<Vec<(i64, Vec<i64>)>>,
     ) -> Result<(), ModelError> {
-        let mut state = StreamingState::new(&self.config);
-        let temperature = temperature.unwrap_or(0.7);
-        let top_k = top_k.unwrap_or(50);
-        let num_acoustic_codebooks = self.config.num_acoustic_codebooks;
+        let _guard = tch::no_grad_guard();
+        let temperature = temperature.unwrap_or(self.config.temperature);
+        let top_k = top_k.unwrap_or(self.config.top_k);
 
-        let encoding = self.tokenizer.encode(text, true)
-            .map_err(|e| ModelError::TokenizationError(format!("Encode failed: {}", e)))?;
-        let prompt_tokens = encoding.get_ids().iter().map(|&id| id as i64).collect::<Vec<i64>>();
-        info!(input_text = %text, token_ids = ?prompt_tokens, "Encoded input text to token IDs");
-        let prompt_tensor = Tensor::from_slice(&prompt_tokens).view((1, -1)).to_device(self.device);
-        let (_batch_size, prompt_len) = prompt_tensor.size2()?;
-
-        state.reset();
-        warn!("StreamingState reset (start of streaming).");
-
-        let prompt_mask = create_causal_mask(prompt_len, self.device)?;
-        let (backbone_hidden_states, prompt_semantic_logits) = self.backbone.forward(
-            &prompt_tensor,
-            0,
-            Some(&prompt_mask),
-            &mut state.backbone_cache,
-            &self.config
-        )?;
-
-        let max_len = self.config.max_seq_len;
-        let max_generation_steps = max_len.saturating_sub(prompt_len);
-        info!("Starting generation loop. Max steps: {}", max_generation_steps);
-
-        let mut prev_step_acoustic_embedding = Tensor::zeros(&[1, self.config.decoder_embed_dim], (Kind::Float, self.device));
-        let last_backbone_state = backbone_hidden_states.select(1, -1).unsqueeze(1);
-
-        let last_semantic_logits = prompt_semantic_logits.select(1, -1);
-        let initial_semantic_token_tensor = sample_topk(&last_semantic_logits, temperature, top_k)?;
-        let current_semantic_token = initial_semantic_token_tensor.int64_value(&[0, 0]);
-
-        for audio_step_counter in 0..max_generation_steps {
-            let decoder_start_pos = prompt_len as usize + audio_step_counter as usize;
-
-            let acoustic_logits_step: Vec<Tensor> = self.decoder.forward(
-                &last_backbone_state,
-                &prev_step_acoustic_embedding.unsqueeze(1),
-                decoder_start_pos,
-                None,
-                &mut state.decoder_cache,
-                None
-            )?;
-
-            let expected_num_acoustic_logits = num_acoustic_codebooks;
-            if acoustic_logits_step.len() != expected_num_acoustic_logits as usize {
-                return Err(ModelError::ProcessError(format!(
-                    "Decoder returned {} acoustic logits, expected {}",
-                    acoustic_logits_step.len(), expected_num_acoustic_logits
-                )));
-            }
-            let mut current_step_acoustic_tokens = Vec::with_capacity(num_acoustic_codebooks as usize);
-            for acoustic_idx in 0..num_acoustic_codebooks as usize {
-                let logits = &acoustic_logits_step[acoustic_idx].squeeze_dims(&[1]);
-                let next_token_tensor = sample_topk(logits, temperature, top_k)?;
-                let next_token = next_token_tensor.int64_value(&[0, 0]);
-                current_step_acoustic_tokens.push(next_token);
-            }
-
-            let eos_generated = current_semantic_token == EOS_TOKEN_ID;
-
-            let tokens_to_send = vec![(current_semantic_token, current_step_acoustic_tokens.clone())];
-            if audio_token_tx.send(tokens_to_send).await.is_err() {
-                 error!("Failed to send audio tokens chunk (semantic, acoustic). Channel closed?");
-                 break;
-            }
-
-            if eos_generated {
-                info!("EOS semantic token ({}) detected at audio step {}, stopping.", current_semantic_token, audio_step_counter);
-                break;
-            }
-
-            prev_step_acoustic_embedding = self.decoder.embed_audio_timestep(&current_step_acoustic_tokens)?;
+        if let Some(seed) = seed {
+            tch::manual_seed(seed as i64);
         }
 
-        info!("Token generation loop finished.");
+        // --- Generate Context Embedding --- 
+        let context_embedding = if let Some(history) = conversation_history {
+            match self.llm_processor.generate_embeddings(history) {
+                Ok(embedding) => {
+                    info!("Generated context embedding (dim: {}) for synthesis.", embedding.dim());
+                    Some(embedding) // Store the whole embedding struct
+                },
+                Err(e) => {
+                    warn!("Failed to generate context embedding: {}. Proceeding without.", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // ----------------------------------
+        
+        // Tokenize input with proper error handling
+        let tokens = self.tokenizer.encode(text, true)
+            .map_err(|e| ModelError::Other(anyhow!("Tokenization failed: {}", e)))?; // Wrap error
+        
+        // Convert tokens to tensors
+        let token_ids = tokens.iter().map(|&t| t as i64).collect::<Vec<_>>();
+        let text_tokens = Tensor::from_slice(&token_ids).to(self.device).unsqueeze(0);
+
+        let mut streaming_state = StreamingState::new(&self.config);
+        streaming_state.reset(); // Ensure caches are clear
+        let mut all_acoustic_tokens_step: Vec<(i64, Vec<i64>)> = Vec::new();
+        let mut acoustic_start_token = Tensor::zeros(&[1, 1], (Kind::Int64, self.device)); // Start token [B, T]
+
+        let start_time = std::time::Instant::now();
+        let mut token_count = 0;
+        
+        // --- Backbone Processing (Once) --- 
+        debug!("Running backbone forward pass...");
+        let backbone_result = self.backbone.forward(
+            &text_tokens, 
+            0, // start_pos for backbone is always 0
+            None, // No mask needed for initial backbone processing?
+            &mut streaming_state.backbone_cache,
+            &self.config,
+            context_embedding.as_ref() // Pass the ContextEmbedding Option
+         );
+         
+        let (backbone_hidden_states, _semantic_logits) = match backbone_result {
+            Ok(result) => result,
+            Err(e) => {
+                error!("Backbone forward pass failed: {}", e);
+                return Err(ModelError::Tch(e));
+            }
+        };
+        debug!("Backbone forward pass completed.");
+        // ----------------------------------
+
+        // --- Decoder Loop --- 
+        for step in 0..self.config.max_seq_len {
+            token_count += 1;
+            let start_pos = if step == 0 { 0 } else { streaming_state.decoder_cache.layer_caches[0].kv.as_ref().map_or(0, |(k, _)| k.size()[2] as usize) };
+            
+            // Embed the previously generated acoustic token for this step
+            // Use the re-added embed_audio method
+            let prev_acoustic_embedded = self.decoder.embed_audio(0, &acoustic_start_token) 
+                 .map_err(ModelError::Tch)?;
+                 
+            // Decoder forward pass
+            let decoder_result = self.decoder.forward(
+                &backbone_hidden_states, // Use the processed backbone output
+                &prev_acoustic_embedded, 
+                start_pos,
+                None, // Masking for decoder?
+                &mut streaming_state.decoder_cache,
+                context_embedding.as_ref().map(|e| &e.tensor) // Pass embedding TENSOR if available
+            );
+
+            let acoustic_logits = match decoder_result {
+                Ok(logits) => logits,
+                Err(e) => {
+                    error!("Decoder forward pass failed at step {}: {}", step, e);
+                    // Attempt to send what we have before erroring
+                    let tokens_to_send = all_acoustic_tokens_step.clone();
+                    if !tokens_to_send.is_empty() {
+                        // All tensor ops done, now safe to await
+                        if audio_token_tx.send(tokens_to_send).await.is_err() {
+                            warn!("Receiver dropped before completing partial send on error.");
+                        }
+                    }
+                    return Err(ModelError::Tch(e));
+                }
+            };
+            
+            // Sample next acoustic tokens
+            let mut next_acoustic_tokens_step = Vec::with_capacity(self.config.num_codebooks as usize);
+            
+            // Sample from logits for each codebook
+            for (_codebook_idx, logits) in acoustic_logits.iter().enumerate() {
+                let squeezed_logits = logits.squeeze_dim(1);
+                let token = match sample_topk(&squeezed_logits, temperature, top_k) {
+                    Ok(t) => t.squeeze().int64_value(&[]),
+                    Err(e) => return Err(ModelError::Tch(e)),
+                };
+                next_acoustic_tokens_step.push(token);
+            }
+            
+            // Prepare the next input token (only the 0th codebook? Needs clarification based on model design)
+            // TODO: Verify this logic - should subsequent inputs use the previously generated token?
+            if next_acoustic_tokens_step.is_empty() {
+                return Err(ModelError::Other(anyhow!("No tokens generated from acoustic logits")));
+            }
+            
+            acoustic_start_token = Tensor::from_slice(&[next_acoustic_tokens_step[0]])
+                 .to(self.device)
+                 .unsqueeze(0); // Shape [1, 1]
+
+            // Store the full set of acoustic tokens for this step
+            // Use step as the frame index (assuming 1 frame per step)
+            all_acoustic_tokens_step.push((step as i64, next_acoustic_tokens_step));
+            
+            // --- Check for EOS token --- 
+            // Need to define how EOS is represented in acoustic tokens. 
+            // Placeholder: Assume a special value or pattern signifies EOS.
+            // This logic needs to be adapted based on the actual model's EOS mechanism.
+            // if next_acoustic_tokens_step[0] == EOS_TOKEN_ID { // Example: check 0th codebook
+            //     info!("EOS token generated at step {}. Stopping generation.", step);
+            //     break;
+            // }
+            // ------------------------- 
+
+            // Send tokens periodically (e.g., every N steps or T milliseconds)
+            // This needs tuning based on desired latency and chunk size.
+            const SEND_INTERVAL_STEPS: usize = 50; // Example: send every 50 steps
+            if !all_acoustic_tokens_step.is_empty() && all_acoustic_tokens_step.len() % SEND_INTERVAL_STEPS == 0 {
+                debug!("Sending batch of {} audio token frames...", all_acoustic_tokens_step.len());
+                
+                // Get copy of tokens, drop tensor references, then await
+                let tokens_to_send = all_acoustic_tokens_step.clone();
+                drop(acoustic_logits);
+                
+                // Now safe to await
+                if audio_token_tx.send(tokens_to_send).await.is_err() {
+                    warn!("Receiver dropped. Stopping generation.");
+                    return Ok(()); // Exit gracefully if the receiver is gone
+                }
+                all_acoustic_tokens_step.clear(); // Clear buffer after sending
+            }
+        }
+        
+        // Send any remaining tokens
+        if !all_acoustic_tokens_step.is_empty() {
+            debug!("Sending final batch of {} audio token frames...", all_acoustic_tokens_step.len());
+            
+            // Safe to await here as we're done with tensors
+            let tokens_to_send = all_acoustic_tokens_step.clone();
+            if audio_token_tx.send(tokens_to_send).await.is_err() {
+                warn!("Receiver dropped before final send.");
+            }
+        }
+        
+        let duration = start_time.elapsed();
+        info!(
+            "Generated {} audio tokens in {:.3}s ({:.2} tokens/s)",
+            token_count,
+            duration.as_secs_f32(),
+            token_count as f32 / duration.as_secs_f32()
+        );
+
         Ok(())
     }
 
+    // Make sure synthesize properly handles the revised token format of (i64, Vec<i64>)
     pub async fn synthesize(
         &mut self,
         text: &str,
+        conversation_history: Option<&ConversationHistory>,
         temperature: Option<f64>,
         top_k: Option<i64>,
         seed: Option<u64>,
     ) -> Result<Vec<i16>, ModelError> {
-        info!("RustCsmModel: Inherent synthesize calling streaming...");
-        let (tx, mut rx) = mpsc::channel(100);
-        let text_clone = text.to_string();
+        // First, call synthesize_streaming to get all tokens
+        let (tx, mut rx) = mpsc::channel::<Vec<(i64, Vec<i64>)>>(1024); // Buffer size
         
-        let stream_result = self.synthesize_streaming_internal(
-             &text_clone, temperature, top_k, seed, tx,
-         ).await;
+        // Run the synthesize_streaming method directly (no spawning)
+        let synthesis_result = self.synthesize_streaming(
+            text, 
+            conversation_history, 
+            temperature, 
+            top_k, 
+            seed, 
+            tx
+        ).await;
         
-        if let Err(e) = stream_result {
-             error!("Underlying streaming token synthesis failed: {}", e);
-             return Err(e);
+        // Check if synthesis succeeded
+        synthesis_result?;
+        
+        // Collect all audio tokens from the channel
+        let mut all_acoustic_tokens: Vec<(i64, Vec<i64>)> = Vec::new();
+        while let Ok(Some(tokens)) = rx.try_recv().map_err(|_| ()).map(Some) {
+            all_acoustic_tokens.extend(tokens);
         }
-        let mut all_token_tuples: Vec<(i64, Vec<i64>)> = Vec::new();
-        while let Some(chunk) = rx.recv().await {
-            all_token_tuples.extend(chunk);
+        
+        if all_acoustic_tokens.is_empty() {
+            warn!("No audio tokens were generated");
+            return Ok(Vec::new());
         }
-        info!("Collected {} token tuples (semantic, acoustic_vec).", all_token_tuples.len());
-        if all_token_tuples.is_empty() { warn!("No token data produced by streaming."); }
-        warn!("Synthesize finished, returning empty audio (vocoder needed). Actual token collection requires vocoder integration.");
-        Ok(Vec::new())
+            
+        // Now that synthesis is complete, decode the tokens
+        let audio_output = self.vocoder.decode(&all_acoustic_tokens)
+            .map_err(|e| {
+                error!("Vocoder failed to decode audio tokens: {}", e);
+                e
+            })?;
+            
+        info!("Synthesized audio: {} tokens -> {} samples", 
+            all_acoustic_tokens.len(),
+            audio_output.len()
+        );
+        
+        Ok(audio_output)
     }
 
-    async fn synthesize_streaming(
+    // This is the internal streaming synthesize method, KEEP conversation_history here
+    pub async fn synthesize_streaming(
         &mut self,
         text: &str,
+        conversation_history: Option<&ConversationHistory>,
         temperature: Option<f64>,
         top_k: Option<i64>,
         seed: Option<u64>,
         audio_token_tx: mpsc::Sender<Vec<(i64, Vec<i64>)>>,
     ) -> Result<(), ModelError> {
-         self.synthesize_streaming_internal(text, temperature, top_k, seed, audio_token_tx).await
+        // Directly call the internal streaming logic, passing history
+        self.synthesize_streaming_internal(text, conversation_history, temperature, top_k, seed, audio_token_tx).await
     }
-}
 
+    // Removed the problematic clone_for_async method
+}

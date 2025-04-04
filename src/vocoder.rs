@@ -32,6 +32,10 @@ pub trait Vocoder: Send + Sync + Debug {
     /// Synthesize audio from a collection of token chunks.
     async fn decode_tokens(&self, token_chunks: Vec<Vec<(i64, Vec<i64>)>>) -> Result<Vec<i16>, ModelError>;
 
+    /// Decode a tensor of acoustic tokens into waveform data.
+    /// This is a synchronous version of decode_tokens for simpler use cases.
+    fn decode(&self, acoustic_tokens: &[(i64, Vec<i64>)]) -> Result<Vec<i16>, ModelError>;
+
     fn sample_rate(&self) -> u32;
 }
 
@@ -1201,6 +1205,29 @@ impl Vocoder for MimiVocoder {
         
         info!("Vocoder: Finished decoding tokens. Total samples: {}", all_audio_samples.len());
         Ok(all_audio_samples)
+    }
+
+    /// Decode a tensor of acoustic tokens into waveform data.
+    /// This is a synchronous version of decode_tokens for simpler use cases.
+    fn decode(&self, acoustic_tokens: &[(i64, Vec<i64>)]) -> Result<Vec<i16>, ModelError> {
+        info!("Vocoder: Decoding {} acoustic tokens...", acoustic_tokens.len());
+        let all_audio_samples = Vec::new();
+        
+        if acoustic_tokens.is_empty() {
+            warn!("Vocoder: decode received no actual token tuples.");
+            return Ok(all_audio_samples); // Return empty if no tokens
+        }
+
+        info!("Vocoder: Processing {} acoustic token tuples.", acoustic_tokens.len());
+        
+        // Convert to Vec<Vec<(i64, Vec<i64>)>> format for decode_tokens
+        let token_chunks = vec![acoustic_tokens.to_vec()];
+        
+        // Use tokio runtime to run the async decode_tokens
+        let rt = tokio::runtime::Runtime::new()
+            .map_err(|e| ModelError::ProcessError(format!("Failed to create runtime: {}", e)))?;
+        
+        rt.block_on(self.decode_tokens(token_chunks))
     }
 
     fn sample_rate(&self) -> u32 {

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use super::*;
+    
     use std::collections::HashMap;
     use std::time::Duration;
     use crate::context::{ConversationHistory, ConversationTurn, Speaker};
@@ -11,6 +11,7 @@ mod tests {
         LlmProcessor,
     };
     use tch::{Tensor, Device};
+    use anyhow::Result;
 
     #[test]
     fn test_context_embedding_creation() {
@@ -60,7 +61,7 @@ mod tests {
         history.add_turn(ConversationTurn::new(Speaker::Model, "I'm doing well, thanks!".to_string()));
         
         // Create a simple embedding generator function
-        let embedding_fn = |_: &str| -> Result<Tensor> {
+        let embedding_fn = |_: &str| -> Result<Tensor, anyhow::Error> {
             let options = (tch::Kind::Float, Device::Cpu);
             let tensor = Tensor::rand(&[512], options);
             Ok(tensor)

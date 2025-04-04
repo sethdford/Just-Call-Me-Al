@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use anyhow::{Result, bail};
 
-use crate::context::{ConversationHistory, Speaker};
+use crate::context::ConversationHistory;
 
 /// Available types of prompt templates
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

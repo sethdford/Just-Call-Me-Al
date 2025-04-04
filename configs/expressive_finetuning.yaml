@@ -1,0 +1,102 @@
+# Configuration for fine-tuning CSM model on expressive speech datasets
+# Using LoRA (Low-Rank Adaptation) for efficient fine-tuning
+
+# Model configuration
+moshi_paths:
+  hf_repo_id: "kyutai/moshiko-pytorch-bf16"  # Base model to fine-tune
+
+# Dataset configuration
+dataset:
+  manifest_path: "data/combined/expressive_train.jsonl"  # Path to training data manifest
+  val_manifest_path: "data/combined/expressive_val.jsonl"  # Path to validation data manifest
+  crop_length_tokens: 2048  # Maximum sequence length in tokens
+  duration_sec: 80  # Duration in seconds of each training sample
+  batch_size: 8  # Batch size for training
+  train_val_split: 0.9  # Split ratio for train/val if no val_manifest provided
+
+# LoRA configuration
+lora:
+  enable: true  # Enable LoRA fine-tuning
+  rank: 128  # Rank of the low-rank matrices
+  alpha: 256  # Alpha scaling factor
+  dropout: 0.1  # Dropout probability for regularization
+  target_modules:  # Modules to apply LoRA to
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  scaling: 2.0  # LoRA scaling factor
+
+# Training parameters
+training:
+  max_steps: 3000  # Maximum number of training steps
+  save_every: 500  # Save checkpoint every N steps
+  eval_every: 100  # Evaluate every N steps
+  save_dir: "checkpoints/expressive_finetuning"  # Directory to save checkpoints
+  warmup_steps: 200  # Learning rate warmup steps
+  log_every: 10  # Log metrics every N steps
+  seed: 42  # Random seed for reproducibility
+  gradient_accumulation_steps: 1  # Number of gradient accumulation steps
+  eval_steps: 50  # Number of evaluation steps
+
+# Optimizer parameters
+optimizer:
+  name: "adamw"  # Optimizer name
+  lr: 4.0e-6  # Learning rate
+  weight_decay: 0.01  # Weight decay
+  beta1: 0.9  # Adam beta1
+  beta2: 0.999  # Adam beta2
+  eps: 1.0e-8  # Adam epsilon
+  clip_grad_norm: 1.0  # Gradient clipping norm
+
+# Scheduler parameters
+scheduler:
+  name: "cosine"  # Learning rate scheduler
+  num_warmup_steps: 200  # Warmup steps
+  num_training_steps: 3000  # Total training steps
+
+# Logging configuration
+logging:
+  wandb: false  # Whether to use Weights & Biases for logging
+  wandb_project: "csm-expressive-finetuning"  # W&B project name
+  wandb_entity: null  # W&B entity name
+  wandb_run_name: null  # W&B run name
+  wandb_watch: false  # Whether to watch gradients in W&B
+
+# Checkpoint configuration
+checkpoint:
+  path: null  # Path to checkpoint to resume from
+  save_every: 500  # Save checkpoint every N steps
+  keep_last_k: 3  # Keep last K checkpoints
+  
+# Distributed training configuration
+distributed:
+  find_unused_parameters: false  # Find unused parameters in DDP
+
+# Advanced configuration
+advanced:
+  amp: true  # Use automatic mixed precision
+  compile: false  # Use torch.compile (requires PyTorch 2.0+)
+  gradient_checkpointing: true  # Use gradient checkpointing to save memory
+  
+# Explain how LoRA settings help with expressive fine-tuning
+# -----------------------------------------------------------
+# The LoRA settings above are designed to efficiently fine-tune the model
+# for expressive speech by targeting specific attention and feed-forward modules.
+# 
+# - rank=128: A higher rank allows more expressive capacity to learn nuanced 
+#   emotional patterns in the speech.
+# 
+# - alpha=256: A higher alpha increases the effective learning rate for LoRA 
+#   parameters, helping to learn expressive features faster.
+# 
+# - target_modules focus on attention and feed-forward projections, which are 
+#   critical for capturing prosodic and emotional patterns in speech.
+# 
+# - Relatively low learning rate (4e-6) to ensure stable fine-tuning.
+# 
+# - Cosine scheduler with warmup helps stabilize training on expressive datasets
+#   which may have more variation than standard speech data. 

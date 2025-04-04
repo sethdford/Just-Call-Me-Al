@@ -3,48 +3,50 @@
 // Copyright (c) Kyutai, all rights reserved.
 // This source code is licensed under the license found in the
 // LICENSE file in the root directory of this source tree.
-use tracing::{info, warn, Level, error};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+// Standard library imports
 use std::sync::Arc;
 use std::path::PathBuf;
+use std::net::SocketAddr;
+
+// Third-party imports
 use anyhow::{Result, anyhow};
 use clap::Parser;
-use csm::models::{CSMModel, CSMImpl, MoshiSpeechModel};
-use csm::models::moshi_speech_model::SpeechModelError;
-use csm::vocoder::{Vocoder, MimiVocoder};
-use csm::models::moshi_speech_model::STTOutput;
 use tch::Device;
-use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
-use std::net::SocketAddr;
 use uuid::Uuid;
 use serde::{Deserialize, Serialize};
-use serde_json::{self, json};
-use axum::extract::ws::{Message, WebSocket};
-use futures_util::{SinkExt, StreamExt};
+use serde_json;
+use tracing::{info, warn, Level, error};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
-// Project modules
-mod context; // Add context module
-mod llm_integration; // Add LLM integration module
-use context::ConversationHistory; // Import the history struct
-use llm_integration::{LlmProcessor, LlmConfig, LlmType, create_llm_service}; // Import LLM types
+// CSM crate imports
+use csm::models::CSMImpl;
+use csm::vocoder::{Vocoder, MimiVocoder};
+use csm::context as csm_context;
+use csm_context::{ConversationHistory as CsmConversationHistory, Speaker as CsmSpeaker};
 
 // Axum imports
 use axum::{
-    extract::{
-        ws::WebSocketUpgrade,
-        State,
-    },
-    response::{Html, IntoResponse, Response},
-    routing::{get, get_service, MethodRouter},
     Router,
-    http::{Uri, StatusCode},
-    body::Body,
+    routing::get,
+    extract::{
+        ws::{Message, WebSocket},
+        State,
+        WebSocketUpgrade,
+    },
+    response::IntoResponse,
 };
 use tower_http::{
     services::ServeDir,
     trace::{DefaultMakeSpan, TraceLayer},
 };
+
+// Project modules
+mod context; // Local context module
+mod llm_integration; // Local LLM integration module
+use context::ConversationHistory;
+use llm_integration::{LlmProcessor, LlmConfig, LlmType, create_llm_service, create_llm_history};
 
 // CLI Arguments
 #[derive(Parser, Debug)]
@@ -89,7 +91,8 @@ fn default_llm_model_path() -> String { "models/llm/model.safetensors".to_string
 struct AppState {
     csm_model: Arc<CSMImpl>,
     vocoder: Arc<Box<dyn Vocoder + Send + Sync>>,
-    speech_model: Option<Arc<MoshiSpeechModel>>,
+    // speech_model temporarily disabled
+    // speech_model: Option<Arc<MoshiSpeechModel>>,
     llm_processor: Arc<dyn LlmProcessor>,
     // Note: AppState is typically shared. For per-connection state like history,
     // it's better managed within the WebSocket handler (handle_socket).
@@ -123,6 +126,22 @@ enum ClientMessageType {
     RequestReset,
 }
 
+// Let's create placeholder types to avoid errors
+#[derive(Debug)]
+struct SpeechModelError(String);
+
+impl std::fmt::Display for SpeechModelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Speech Model Error: {}", self.0)
+    }
+}
+
+struct STTOutput {
+    full_transcript: String,
+    start_time: f64,
+    stop_time: f64,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Setup logging
@@ -148,12 +167,49 @@ async fn main() -> Result<()> {
     };
     info!("Using device: {:?}", device);
 
+    // Initialize LLM processor
+    let llm_config = match config.llm_type.to_lowercase().as_str() {
+        "llama" => LlmConfig {
+            llm_type: LlmType::Llama,
+            model_path: Some(args.model_dir.join(&config.llm_model_path)),
+            use_gpu: device != Device::Cpu,
+            embedding_dim: 768,
+            ..Default::default()
+        },
+        "mistral" => LlmConfig {
+            llm_type: LlmType::Mistral,
+            model_path: Some(args.model_dir.join(&config.llm_model_path)),
+            use_gpu: device != Device::Cpu,
+            embedding_dim: 1024,
+            ..Default::default()
+        },
+        "local" => LlmConfig {
+            llm_type: LlmType::Local,
+            model_path: Some(args.model_dir.join(&config.llm_model_path)),
+            use_gpu: device != Device::Cpu,
+            embedding_dim: 768,
+            ..Default::default()
+        },
+        _ => {
+            info!("Using mock LLM processor for development");
+            LlmConfig::default() // Uses Mock LLM type
+        }
+    };
+    
+    let llm_processor = create_llm_service(llm_config)
+        .map_err(|e| anyhow!("Failed to initialize LLM processor: {}", e))?;
+    info!("LLM processor initialized.");
+
     // --- Load CSM Model --- 
     let csm_model_dir = args.model_dir.join("csm-1b"); // Define the model directory
     // let csm_config_path = args.model_dir.join("csm-1b/config.json"); // Config loaded internally by CSMImpl::new
     // let csm_weights_path = args.model_dir.join("csm-1b/model.safetensors"); // Weights loaded internally by CSMImpl::new
     // let csm_config = CsmModelConfig::from_file(&csm_config_path)?;
-    let csm_impl = CSMImpl::new(&csm_model_dir, device)?; // Use CSMImpl::new with model dir and device
+    let csm_impl = CSMImpl::new(&csm_model_dir, device)
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to create CSM model: {}", e);
+            std::process::exit(1);
+        });
     let csm_model = Arc::new(csm_impl);
     info!("CSM model loaded.");
     
@@ -172,6 +228,9 @@ async fn main() -> Result<()> {
     // --------------------------------
 
     // Initialize Moshi Speech Model if files exist
+    // let speech_model: Option<Arc<MoshiSpeechModel>> = None; // Temporarily disable Moshi
+    warn!("Moshi Speech Model temporarily disabled due to compile issues.");
+    /* // Temporarily comment out Moshi initialization
     let speech_model = if std::path::Path::new(&config.moshi_model_path).exists()
            && std::path::Path::new(&config.tokenizer_path).exists()
            && std::path::Path::new(&config.mimi_model_path).exists() {
@@ -222,45 +281,12 @@ async fn main() -> Result<()> {
         warn!("Required Moshi model files not found. Speech capabilities will be disabled.");
         None
     };
-
-    // Initialize LLM processor
-    let llm_config = match config.llm_type.to_lowercase().as_str() {
-        "llama" => LlmConfig {
-            llm_type: LlmType::Llama,
-            model_path: Some(args.model_dir.join(&config.llm_model_path)),
-            use_gpu: device != Device::Cpu,
-            embedding_dim: 768,
-            ..Default::default()
-        },
-        "mistral" => LlmConfig {
-            llm_type: LlmType::Mistral,
-            model_path: Some(args.model_dir.join(&config.llm_model_path)),
-            use_gpu: device != Device::Cpu,
-            embedding_dim: 1024,
-            ..Default::default()
-        },
-        "local" => LlmConfig {
-            llm_type: LlmType::Local,
-            model_path: Some(args.model_dir.join(&config.llm_model_path)),
-            use_gpu: device != Device::Cpu,
-            embedding_dim: 768,
-            ..Default::default()
-        },
-        _ => {
-            info!("Using mock LLM processor for development");
-            LlmConfig::default() // Uses Mock LLM type
-        }
-    };
-    
-    let llm_processor = create_llm_service(llm_config)
-        .map_err(|e| anyhow!("Failed to initialize LLM processor: {}", e))?;
-    info!("LLM processor initialized.");
+    */
 
     // Create application state
     let app_state = Arc::new(AppState {
         csm_model,
         vocoder,
-        speech_model,
         llm_processor,
         // conversation_history: Arc::new(TokioMutex::new(ConversationHistory::new(None))), // Initialize shared history if needed
     });
@@ -297,9 +323,11 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     info!("New WebSocket connection: {}", session_id);
 
     // --- Per-Connection State --- 
-    let mut conversation_history = ConversationHistory::new(None); // Each connection gets its own history
+    let mut conversation_history = context::ConversationHistory::new(None); // Each connection gets its own history
     let mut current_asr_stream: Option<mpsc::Sender<Vec<f32>>> = None;
-    let mut current_asr_task: Option<tokio::task::JoinHandle<Result<STTOutput, SpeechModelError>>> = None;
+    let mut current_asr_task: Option<
+        tokio::task::JoinHandle<Result<STTOutput, SpeechModelError>>
+    > = None;
 
     // Send initial info message
     let _ = socket.send(Message::Text(serde_json::to_string(&ServerMessage::Info {
@@ -322,7 +350,9 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 conversation_history.add_turn(user_turn);
 
                                 // 2. Use LLM to generate a contextual response
-                                let llm_response = match state.llm_processor.generate_response(&conversation_history) {
+                                // Create a local LLM ConversationHistory
+                                let llm_history = create_llm_history(&conversation_history);
+                                let llm_response = match state.llm_processor.generate_response(&llm_history) {
                                     Ok(response) => {
                                         info!("LLM generated response: {}", response);
                                         response
@@ -334,7 +364,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 };
 
                                 // 3. Use LLM to generate contextual embeddings
-                                let _contextual_embedding = match state.llm_processor.generate_embeddings(&conversation_history) {
+                                let _contextual_embedding = match state.llm_processor.generate_embeddings(&llm_history) {
                                     Ok(embedding) => {
                                         info!("Generated contextual embedding with dimension {}", embedding.dim());
                                         Some(embedding)
@@ -363,7 +393,13 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 let model_turn = context::ConversationTurn::new(context::Speaker::Model, llm_response);
                                 conversation_history.add_turn(model_turn);
                             },
-                            ClientMessageType::AudioData { data, sample_rate, request_codes } => {
+                            ClientMessageType::AudioData { data: _, sample_rate: _, request_codes: _ } => {
+                                // Temporarily disable ASR functionality
+                                warn!("Received audio data, but Moshi Speech Model (ASR) is temporarily disabled.");
+                                let _ = socket.send(Message::Text(serde_json::to_string(&ServerMessage::Error {
+                                    message: "ASR functionality is temporarily disabled.".to_string()
+                                }).unwrap())).await;
+                                /* // Temporarily comment out ASR logic
                                 // Handle incoming audio for STT (if speech_model exists)
                                 if let Some(speech_model) = state.speech_model.as_ref() {
                                     // If no ASR stream exists, create one
@@ -416,6 +452,7 @@ async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
                                 } else {
                                     warn!("Received audio data but no speech model configured/loaded.");
                                 }
+                                */
                             }
                             ClientMessageType::EndSpeech => {
                                 info!("Received EndSpeech signal.");

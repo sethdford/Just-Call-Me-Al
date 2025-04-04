@@ -4,15 +4,15 @@
 //! conversation history using LLM models.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use anyhow::{Result, Context as AnyhowContext};
 use tch::Tensor;
 
-use crate::context::{ConversationHistory, Speaker};
+use crate::context::ConversationHistory;
 
 /// A fixed-dimension embedding representing the context of a conversation
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ContextEmbedding {
     /// The tensor containing the embedding values
     pub tensor: Tensor,
@@ -20,6 +20,17 @@ pub struct ContextEmbedding {
     pub generated_at: Instant,
     /// Metadata about the embedding
     pub metadata: HashMap<String, String>,
+}
+
+// Manually implement Clone
+impl Clone for ContextEmbedding {
+    fn clone(&self) -> Self {
+        Self {
+            tensor: self.tensor.copy(), // Use Tensor::copy() for cloning
+            generated_at: self.generated_at, // Instant is Copy
+            metadata: self.metadata.clone(), // HashMap implements Clone
+        }
+    }
 }
 
 impl ContextEmbedding {
