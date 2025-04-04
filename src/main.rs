@@ -81,34 +81,29 @@ struct AppState {
 }
 
 // WebSocket Message Types
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Debug)]
 #[serde(tag = "type")]
 enum ServerMessage {
-    #[serde(rename = "init")]
-    Init { stt_available: bool },
-    #[serde(rename = "audio_info")]
-    AudioInfo { sample_rate: u32, channels: u16 },
-    #[serde(rename = "audio_chunk")]
-    AudioChunk { data: String }, // Base64 encoded audio
-    #[serde(rename = "pong")]
-    Pong,
-    #[serde(rename = "error")]
-    Error(String),
-    #[serde(rename = "transcript")]
-    Transcript { text: String, start_time: f64, stop_time: f64, audio_codes: serde_json::Value },
+    Info { message: String },
+    Error { message: String },
+    Transcript { 
+        text: String, 
+        start_time: f64, 
+        stop_time: f64, 
+    },
+    PartialTranscript { partial: String },
+    SpeechEnded,
+    SpeechCodes { codes: Vec<i32> }, // Keep original CSM output if needed
+    SynthesizedAudio { data: Vec<f32>, sample_rate: u32 }, // New variant for TTS audio output
 }
 
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type")]
 enum ClientMessageType {
-    #[serde(rename = "synthesize")]
     Synthesize { text: String, emotion: Option<String>, style: Option<String> },
-    #[serde(rename = "ping")]
-    Ping,
-    #[serde(rename = "stop_audio")]
-    StopAudio,
-    #[serde(rename = "audio_data")]
     AudioData { data: Vec<f32>, sample_rate: u32, #[serde(default)] request_codes: bool },
+    EndSpeech,
+    RequestReset,
 }
 
 #[tokio::main]
@@ -278,213 +273,196 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     };
 
     // Send initial message
-    let init_msg = serde_json::to_string(&ServerMessage::Init { stt_available }).unwrap();
+    let init_msg = serde_json::to_string(&ServerMessage::Info { message: format!("Connected. STT Available: {}", stt_available) }).unwrap();
     if let Err(e) = sender.lock().await.send(Message::Text(init_msg)).await {
         error!("Error sending initial message: {}", e);
         return;
     }
 
-    // Clone sender and request_codes flag for STT task
+    // Clone sender and state for various tasks
     let sender_for_stt = sender.clone();
     let request_codes_for_stt = request_codes.clone();
+    let sender_for_receiver = sender.clone();
+    let state_for_receiver = state.clone(); // Clone state for receiver loop
+    let audio_tx_for_receiver = audio_tx.clone(); // Clone audio_tx for receiver loop
 
-    // Create STT output task (receives Result<Vec<STTOutput>, SpeechModelError>)
+    // Spawn STT output processing task
     let stt_task = if let Some(mut rx) = text_rx_option { // Take ownership of rx
         Some(tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
                 match result {
                     Ok(outputs) => {
-                        if outputs.is_empty() { continue; }
-
+                        // Iterate through the Vec<STTOutput>
                         for output in outputs {
-                            let word = output.word;
-                            let include_codes = request_codes_for_stt.load(std::sync::atomic::Ordering::Relaxed);
-                            let codes_json = if include_codes {
-                                // TODO: Implement Tensor serialization or conversion if needed.
-                                // For now, just send null as Tensor cannot be directly serialized.
-                                // match output.audio_codes {
-                                //     Some(codes) => json!(codes), // This causes the error
-                                //     None => json!(null),
-                                // }
-                                json!(null) // Send null for now
-                            } else {
-                                json!(null)
-                            };
-
+                            // Access fields directly from the STTOutput struct
                             let transcript_msg = ServerMessage::Transcript {
-                                text: word.text,
-                                start_time: word.start_time,
-                                stop_time: word.stop_time,
-                                audio_codes: codes_json,
+                                text: output.word.text,
+                                start_time: output.word.start_time,
+                                stop_time: output.word.stop_time,
+                                // Omit audio_codes for now
                             };
-                            let msg = serde_json::to_string(&transcript_msg).unwrap();
 
-                            let sender_clone = sender_for_stt.clone();
-                            let msg_clone = msg.clone();
-                            tokio::spawn(async move {
-                                let mut guard = sender_clone.lock().await;
-                                if let Err(e) = guard.send(Message::Text(msg_clone)).await {
-                                    error!("Failed to send transcript: {}", e);
+                            if let Ok(json_msg) = serde_json::to_string(&transcript_msg) {
+                                let mut guard = sender_for_stt.lock().await;
+                                if let Err(e) = guard.send(Message::Text(json_msg)).await {
+                                    error!(session_id = %session_id, "Error sending STT transcript message: {}", e);
+                                    break; // Exit loop on send error
                                 }
-                            });
+                            } else {
+                                error!(session_id = %session_id, "Failed to serialize STT transcript message");
+                            }
+                            
+                            // TODO: Decide if/how to handle SpeechEnded/PartialTranscript if Moshi provides them via STTOutput 
+                            // The current STTOutput struct only has 'word' and 'audio_codes'.
+                            // If Moshi signals the end via an empty Vec or a specific error, 
+                            // that logic should be handled outside this inner loop.
                         }
                     }
                     Err(e) => {
                         error!(session_id = %session_id, "Error receiving STT output: {}", e);
-                        let error_resp = ServerMessage::Error(format!("STT Processing Error: {}", e));
+                        let error_resp = ServerMessage::Error { message: format!("STT Processing Error: {}", e) };
                         if let Ok(err_json) = serde_json::to_string(&error_resp) {
                            let mut guard = sender_for_stt.lock().await;
-                           let _ = guard.send(Message::Text(err_json)).await;
+                           let _ = guard.send(Message::Text(err_json)).await; // Ignore error
                         }
-                        // Consider whether to break the loop on error
+                        break; // Stop processing on error
                     }
                 }
             }
-            info!(session_id = %session_id, "STT processing task finished.");
+            info!(session_id = %session_id, "STT receiver task finished");
         }))
     } else {
         None
     };
 
-    // Create task to handle incoming messages
-    let receiver_task = tokio::spawn(async move {
-        // Clone Arcs needed for this task
-        let audio_tx_for_receiver = audio_tx.clone(); // Clone Option<Sender>
-        let sender_for_receiver = sender.clone(); // Clone Arc<Mutex<Sender>>
-        let state_for_receiver = state.clone(); // Clone Arc<AppState>
-        let request_codes_for_receiver = request_codes.clone(); // Clone Arc<AtomicBool>
-
-        while let Some(result) = receiver.next().await {
-            match result {
-                Ok(message) => {
-                    match message {
-                        Message::Text(text) => {
-                            match serde_json::from_str::<ClientMessageType>(&text) {
-                                Ok(ClientMessageType::Synthesize { text, emotion: _, style: _ }) => {
-                                    // TODO: Handle emotion/style later. For now, use standard synthesize.
-                                    info!(session_id = %session_id, "Received synthesize request for text: {}", text);
-                                    let csm_model_clone = state_for_receiver.csm_model.clone();
-                                    let sender_for_synthesis = sender_for_receiver.clone(); // Clone sender for the spawned task
-                                    
-                                    tokio::spawn(async move {
-                                        // Call synthesize with correct args (temp, top_k, seed)
-                                        // Using None for now, extract from ClientMessage later if needed.
-                                        let result = csm_model_clone.synthesize(
-                                            &text,
-                                            None, // temperature
-                                            None, // top_k
-                                            None, // seed
-                                        ).await;
-                                        
-                                        // Handle result: Send audio via WebSocket
-                                        match result {
-                                            Ok(audio_i16) => {
-                                                info!(session_id = %session_id, "Synthesized {} audio samples (i16)", audio_i16.len());
-                                                // Convert i16 to f32 for WebSocket transmission if needed, or send as i16 bytes
-                                                let bytes: Vec<u8> = audio_i16.into_iter()
-                                                    .flat_map(|s| s.to_le_bytes())
-                                                    .collect();
-                                                let mut guard = sender_for_synthesis.lock().await; // Use the cloned sender
-                                                if let Err(e) = guard.send(Message::Binary(bytes)).await {
-                                                     error!(session_id = %session_id, "Failed to send synthesized audio: {}", e);
-                                                }
-                                            }
-                                            Err(e) => {
-                                                error!(session_id = %session_id, "Synthesis failed: {}", e);
-                                                let error_resp = ServerMessage::Error(format!("Synthesis failed: {}", e));
-                                                if let Ok(err_json) = serde_json::to_string(&error_resp) {
-                                                     let mut guard = sender_for_synthesis.lock().await; // Use the cloned sender
-                                                    let _ = guard.send(Message::Text(err_json)).await;
-                                                }
-                                            }
-                                        }
-                                    });
-                                },
-                                Ok(ClientMessageType::Ping) => {
-                                    let pong_msg = ServerMessage::Pong;
-                                    if let Ok(json_msg) = serde_json::to_string(&pong_msg) {
-                                        let mut sender_guard = sender_for_receiver.lock().await;
-                                        if let Err(e) = sender_guard.send(Message::Text(json_msg)).await {
-                                            error!(session_id = %session_id, "Receive task: Failed to send pong response: {}. Closing.", e);
-                                            break;
-                                        }
-                                    }
-                                },
-                                Ok(ClientMessageType::StopAudio) => {
-                                    info!(session_id = %session_id, "Receive task: Received stop_audio signal from client.");
-                                    break;
-                                },
-                                Ok(ClientMessageType::AudioData { data, sample_rate: _, request_codes: req_codes }) => {
-                                    request_codes_for_receiver.store(req_codes, std::sync::atomic::Ordering::Relaxed);
-                                    if let Some(tx) = &audio_tx_for_receiver {
-                                        if let Err(e) = tx.send(data).await {
-                                            error!("Failed to send audio data to STT channel: {}", e);
-                                        }
-                                    } else if !stt_available {
-                                        warn!(session_id = %session_id, "Received audio_data but STT is not available/initialized.");
-                                    }
-                                },
-                                Err(e) => {
-                                     warn!(session_id = %session_id, raw_text = text, "Failed to parse client message: {}", e);
-                                     let error_resp = ServerMessage::Error(format!("Invalid message format: {}", e));
-                                     if let Ok(err_json) = serde_json::to_string(&error_resp) {
-                                         let mut sender_guard = sender_for_receiver.lock().await;
-                                         let _ = sender_guard.send(Message::Text(err_json)).await.map_err(|e| {
-                                             error!(session_id = %session_id, "Receive task: Failed to send error response: {}. Closing.", e);
-                                         });
-                                     }
+    // Receive loop
+    let receive_task = tokio::spawn(async move {
+        while let Some(msg) = receiver.next().await {
+            match msg {
+                Ok(Message::Text(text)) => {
+                    match serde_json::from_str::<ClientMessageType>(&text) {
+                        Ok(ClientMessageType::AudioData { data, sample_rate, request_codes: req_codes }) => {
+                             request_codes_for_stt.store(req_codes, std::sync::atomic::Ordering::Relaxed);
+                            if let Some(ref tx) = audio_tx_for_receiver {
+                                if sample_rate != 24000 {
+                                    warn!(session_id = %session_id, "Received audio with unexpected sample rate: {}, expected 24000", sample_rate);
+                                    // TODO: Add resampling if needed
+                                    continue;
                                 }
+                                if tx.send(data).await.is_err() {
+                                    error!(session_id = %session_id, "Audio channel closed, cannot send audio data.");
+                                    break;
+                                }
+                            } else {
+                                warn!(session_id = %session_id, "Received audio data, but STT is not available.");
                             }
-                        }
-                        Message::Binary(data) => {
-                             if let Some(tx) = &audio_tx_for_receiver { // Use cloned tx
-                                 if data.len() % 2 == 0 {
-                                     let samples: Vec<f32> = data
-                                         .chunks_exact(2)
-                                         .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]) as f32 / 32768.0)
-                                         .collect();
-                                     if let Err(e) = tx.send(samples).await {
-                                         error!("Failed to send binary audio data to STT channel: {}", e);
+                        },
+                        Ok(ClientMessageType::Synthesize { text, .. }) => {
+                             info!(session_id = %session_id, "Received synthesize request for text: {}", text);
+                             if let Some(model) = &state_for_receiver.speech_model {
+                                 // Clone Arc for the synthesis task
+                                 let model_clone = model.clone();
+                                 let sender_clone = sender_for_receiver.clone();
+                                 let text_clone = text.clone(); // Clone text for the async block
+                                 let session_id_clone = session_id; // Clone session_id for the async block
+
+                                 tokio::spawn(async move {
+                                     info!(session_id = %session_id_clone, "Spawning TTS task for: {}", text_clone);
+                                     match model_clone.synthesize_audio(&text_clone, None, None, None).await {
+                                         Ok(audio_data) => {
+                                             info!(session_id = %session_id_clone, "TTS synthesis successful, sending audio ({} samples).", audio_data.len());
+                                             let response = ServerMessage::SynthesizedAudio { 
+                                                 data: audio_data, 
+                                                 sample_rate: 24000 // Assuming TTS output SR is 24kHz
+                                             };
+                                             if let Ok(json_msg) = serde_json::to_string(&response) {
+                                                let mut guard = sender_clone.lock().await;
+                                                if let Err(e) = guard.send(Message::Text(json_msg)).await {
+                                                    error!(session_id = %session_id_clone, "Failed to send synthesized audio: {}", e);
+                                                }
+                                             } else {
+                                                 error!(session_id = %session_id_clone, "Failed to serialize synthesized audio response.");
+                                             }
+                                         },
+                                         Err(e) => {
+                                             error!(session_id = %session_id_clone, "TTS synthesis failed: {}", e);
+                                             let error_resp = ServerMessage::Error { message: format!("TTS Synthesis failed: {}", e) };
+                                             if let Ok(err_json) = serde_json::to_string(&error_resp) {
+                                                let mut guard = sender_clone.lock().await;
+                                                let _ = guard.send(Message::Text(err_json)).await;
+                                             }
+                                         }
                                      }
-                                 } else {
-                                      warn!(session_id = %session_id, "Received binary data with odd length, cannot decode as i16 PCM.");
-                                 }
+                                     info!(session_id = %session_id_clone, "TTS task finished for: {}", text_clone);
+                                 });
                              } else {
-                                warn!(session_id = %session_id, "Received binary audio data but STT is not available.");
-                            }
-                        }
-                        Message::Ping(ping) => {
+                                 warn!(session_id = %session_id, "Received synthesize request, but TTS model is not available.");
+                                 let error_resp = ServerMessage::Error { message: "TTS functionality is not available.".to_string() };
+                                 if let Ok(err_json) = serde_json::to_string(&error_resp) {
+                                     let mut sender_guard = sender_for_receiver.lock().await;
+                                     let _ = sender_guard.send(Message::Text(err_json)).await;
+                                 }
+                             }
+                         },
+                        Ok(ClientMessageType::EndSpeech) => {
+                            info!(session_id = %session_id, "Received end_speech signal from client.");
+                            // Optionally signal the STT model or other components
+                            let end_msg = ServerMessage::SpeechEnded;
                             let mut sender_guard = sender_for_receiver.lock().await;
-                            if let Err(e) = sender_guard.send(Message::Pong(ping)).await {
-                                error!(session_id = %session_id, "Receive task: Failed to send pong (from ping): {}. Closing.", e);
-                                break;
+                            let _ = sender_guard.send(Message::Text(serde_json::to_string(&end_msg).unwrap())).await;
+                        },
+                        Ok(ClientMessageType::RequestReset) => {
+                            info!(session_id = %session_id, "Received reset signal from client.");
+                            if let Some(model) = &state_for_receiver.speech_model {
+                                model.reset().await;
+                                info!(session_id = %session_id, "Speech model state reset.");
+                                let reset_msg = ServerMessage::Info { message: "Model state reset.".to_string() };
+                                let mut sender_guard = sender_for_receiver.lock().await;
+                                let _ = sender_guard.send(Message::Text(serde_json::to_string(&reset_msg).unwrap())).await;
+                            } else {
+                                warn!(session_id = %session_id, "Received reset request, but speech model is not available.");
                             }
-                        }
-                        Message::Pong(_) => { /* Keepalive */ }
-                        Message::Close(_) => {
-                            info!(session_id = %session_id, "Client requested close.");
-                            break;
+                        },
+                        Err(e) => {
+                             warn!(session_id = %session_id, raw_text = text, "Failed to parse client message: {}", e);
+                             let error_resp = ServerMessage::Error { message: format!("Invalid message format: {}", e) };
+                             if let Ok(err_json) = serde_json::to_string(&error_resp) {
+                                 let mut sender_guard = sender_for_receiver.lock().await;
+                                 let _ = sender_guard.send(Message::Text(err_json)).await;
+                             }
                         }
                     }
-                }
+                },
+                Ok(Message::Binary(data)) => {
+                    warn!(session_id = %session_id, "Received unexpected binary message ({} bytes), ignoring.", data.len());
+                },
+                Ok(Message::Close(_)) => {
+                    info!(session_id = %session_id, "Client requested close.");
+                    break;
+                },
+                Ok(Message::Ping(p)) => {
+                    let mut sender_guard = sender_for_receiver.lock().await;
+                    if sender_guard.send(Message::Pong(p)).await.is_err() {
+                        break; // Exit if pong fails
+                    }
+                },
+                Ok(Message::Pong(_)) => {
+                    // Pong received, do nothing
+                },
                 Err(e) => {
-                    warn!(session_id = %session_id, "WebSocket receive error: {}", e);
+                    error!(session_id = %session_id, "Error receiving message: {}", e);
                     break;
                 }
             }
         }
-        info!(session_id = %session_id, "Receive task FINISHED.");
+        info!(session_id = %session_id, "Receiver task finished.");
     });
 
-    // Wait for tasks to complete
-    if let Some(stt_task) = stt_task {
-        tokio::select! {
-            res = receiver_task => { if let Err(e) = res { error!("Receiver task join error: {}", e); } },
-            res = stt_task => { if let Err(e) = res { error!("STT task join error: {}", e); } },
-        }
-    } else {
-        receiver_task.await.unwrap_or_else(|e| error!("Error in receiver task: {}", e));
+    // Wait for tasks to complete (or abort if needed)
+    if let Some(task) = stt_task {
+        let _ = task.await; // Wait for STT task
     }
+    let _ = receive_task.await; // Wait for receiver task
 
-    info!(session_id = %session_id, "WebSocket client disconnected and handle_socket finished.");
+    info!(session_id = %session_id, "WebSocket client disconnected");
 } 

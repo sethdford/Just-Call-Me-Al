@@ -1,6 +1,6 @@
 "use client"; // Required for components with hooks and event handlers
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, Component, ErrorInfo, ReactNode } from 'react';
 // We will add state management (useState, useEffect, etc.) later
 
 // Define the structure for messages if needed
@@ -15,9 +15,93 @@ interface RecognizedWord {
   stop_time: number;
 }
 
+// WebSocket message type definitions
+interface WSMessageBase {
+  type: string;
+}
+
+interface WSAudioData extends WSMessageBase {
+  type: 'AudioData';
+  data: number[];
+  sampleRate: number;
+  request_codes: boolean;
+}
+
+// Add proper AudioWorklet message event type
+interface AudioWorkletMessage {
+  data: Float32Array;
+}
+
+interface WSSynthesize extends WSMessageBase {
+  type: 'Synthesize';
+  text: string;
+  emotion: string | null;
+  style: string | null;
+}
+
+interface WSEndSpeech extends WSMessageBase {
+  type: 'EndSpeech';
+}
+
+interface WSError extends WSMessageBase {
+  type: 'error';
+  message: string;
+}
+
+interface WSInit extends WSMessageBase {
+  type: 'init';
+  stt_available: boolean;
+}
+
+interface WSTranscript extends WSMessageBase {
+  type: 'transcript';
+  text: string;
+  start_time: number;
+  stop_time: number;
+}
+
+interface WSTranscription extends WSMessageBase {
+  type: 'transcription';
+  text: string;
+}
+
+type WSMessage = WSAudioData | WSSynthesize | WSEndSpeech | WSError | WSInit | WSTranscript | WSTranscription;
+
 // --- Constants ---
 const AUDIO_WORKLET_PROCESSOR_URL = '/audio-worklet-processor.js'; // Path in public directory
-const TARGET_SAMPLE_RATE = 16000; // Or your desired sample rate
+const TARGET_SAMPLE_RATE = 24000; // Match backend if possible
+const AUDIO_BUFFER_SIZE = 2048; // Smaller buffer size for reduced latency
+const MAX_RECONNECT_ATTEMPTS = 5;
+const RECONNECT_INTERVAL_BASE = 1000; // Base reconnect interval in ms
+
+// --- Error Boundary Component ---
+class ErrorBoundary extends Component<{children: ReactNode, fallback?: ReactNode}> {
+  state = { hasError: false, error: null };
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+    console.error("Application error:", error, errorInfo);
+    // Could send to error logging service here
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return this.props.fallback || (
+        <div className="error-boundary">
+          <h2>Something went wrong</h2>
+          <p>Please refresh the page to try again.</p>
+          <button onClick={() => window.location.reload()}>
+            Refresh Page
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 // --- Audio Player Class (Adapted) ---
 class AudioPlayer {
@@ -130,7 +214,105 @@ class AudioPlayer {
     }
 }
 
+// --- WebSocket Connection Handler with Reconnection ---
+function useWebSocketWithReconnect(wsUrl: string, onMessage: (event: MessageEvent) => void) {
+  const [wsState, setWsState] = useState<'connecting' | 'connected' | 'disconnected' | 'reconnecting'>('disconnected');
+  const wsRef = useRef<WebSocket | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const connectWebSocket = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    
+    setWsState(reconnectAttemptRef.current > 0 ? 'reconnecting' : 'connecting');
+    
+    try {
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
+      
+      ws.onopen = () => {
+        console.log("WebSocket connection established");
+        setWsState('connected');
+        reconnectAttemptRef.current = 0; // Reset reconnect attempts on successful connection
+      };
+      
+      ws.onmessage = onMessage;
+      
+      ws.onerror = (event) => {
+        console.error("WebSocket error:", event);
+      };
+      
+      ws.onclose = (event) => {
+        console.log(`WebSocket closed: ${event.code} ${event.reason}`);
+        setWsState('disconnected');
+        
+        // Only attempt reconnection if not a normal closure
+        if (event.code !== 1000 && event.code !== 1001) {
+          scheduleReconnect();
+        }
+      };
+    } catch (err) {
+      console.error("WebSocket connection failed:", err);
+      setWsState('disconnected');
+      scheduleReconnect();
+    }
+  }, [wsUrl, onMessage]);
+  
+  const scheduleReconnect = useCallback(() => {
+    if (reconnectAttemptRef.current >= MAX_RECONNECT_ATTEMPTS) {
+      console.log("Maximum reconnect attempts reached");
+      return;
+    }
+    
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+    }
+    
+    const delay = RECONNECT_INTERVAL_BASE * Math.pow(2, reconnectAttemptRef.current);
+    console.log(`Scheduling reconnect in ${delay}ms (attempt ${reconnectAttemptRef.current + 1})`);
+    
+    reconnectTimeoutRef.current = setTimeout(() => {
+      reconnectAttemptRef.current += 1;
+      connectWebSocket();
+    }, delay);
+  }, [connectWebSocket]);
+  
+  const disconnect = useCallback(() => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.close(1000, "Client disconnecting");
+    }
+    
+    wsRef.current = null;
+    setWsState('disconnected');
+  }, []);
+  
+  // Connect on component mount and url changes
+  useEffect(() => {
+    connectWebSocket();
+    
+    return () => {
+      disconnect();
+    };
+  }, [wsUrl, connectWebSocket, disconnect]);
+  
+  return { wsRef, wsState, reconnect: connectWebSocket, disconnect };
+}
+
 export default function Home() {
+  // Wrap the component with ErrorBoundary
+  return (
+    <ErrorBoundary>
+      <HomeContent />
+    </ErrorBoundary>
+  );
+}
+
+function HomeContent() {
   // --- State Variables ---
   const [status, setStatus] = useState<string>('Initializing...');
   const [error, setError] = useState<string | null>(null);
@@ -147,6 +329,12 @@ export default function Home() {
   const [recognizedWords, setRecognizedWords] = useState<RecognizedWord[]>([]);
   const [isMicActive, setIsMicActive] = useState<boolean>(false);
   const [isSTTAvailable, setIsSTTAvailable] = useState<boolean>(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isSttProcessing, setIsSttProcessing] = useState(false);
+  const [partialTranscript, setPartialTranscript] = useState<string>('');
+  const [audioQueue, setAudioQueue] = useState<Float32Array[]>([]);
+  const [ttsInput, setTtsInput] = useState<string>(''); // State for TTS input
+  const [isPlayingTts, setIsPlayingTts] = useState<boolean>(false); // State to track TTS playback
 
   // Refs
   const isInitializingAudio = useRef<boolean>(false); // Prevent race conditions
@@ -156,7 +344,9 @@ export default function Home() {
   const audioQueueRef = useRef<AudioBuffer[]>([]);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
-  const processorRef = useRef<ScriptProcessorNode | null>(null);
+  const processorRef = useRef<AudioWorkletNode | null>(null);
+  const sourceNode = useRef<AudioBufferSourceNode | null>(null); // Ref for audio playback source
+  const audioChunks = useRef<Blob[]>([]); // Store raw audio chunks
 
   // --- Helper Functions (useCallback for stability) ---
   const log = useCallback((message: string, level: string = 'info') => {
@@ -172,7 +362,7 @@ export default function Home() {
     setError(message);
     log(`Error shown: ${message}`, 'error');
     // Optionally clear the error after a delay
-    // setTimeout(() => setError(null), 5000);
+    // setTimeout(() => setError(null), 7000);
   }, [log]);
 
   // --- Audio Initialization Logic ---
@@ -187,7 +377,7 @@ export default function Home() {
 
     try {
       const context = new (window.AudioContext || (window as any).webkitAudioContext)({
-        sampleRate: TARGET_SAMPLE_RATE, // Ensure context matches target rate
+        sampleRate: TARGET_SAMPLE_RATE,
         latencyHint: 'interactive'
       });
       setAudioContext(context);
@@ -203,14 +393,15 @@ export default function Home() {
             log(`AudioContext resumed. State: ${context.state}`);
             if (context.state === 'running') {
               updateStatus("Audio Ready.");
-              // Try initializing worklet/player *after* resume succeeds
-              await loadWorkletAndPlayer(context);
+              setIsReady(true); // Enable buttons now that context is running
             } else {
               showError("Failed to resume audio context.");
+              setIsReady(false);
             }
-          } catch (err) {
-            console.error("Error resuming AudioContext:", err);
-            showError("Could not enable audio.");
+          } catch (error: unknown) {
+            console.error("Error resuming AudioContext:", error);
+            showError("Failed to resume audio.");
+            setIsReady(false);
           } finally {
             document.body.removeEventListener('click', resume);
             document.body.removeEventListener('keydown', resume);
@@ -220,45 +411,18 @@ export default function Home() {
         document.body.addEventListener('keydown', resume, { once: true });
       } else {
         // If context is already running, proceed directly
-        await loadWorkletAndPlayer(context);
+        updateStatus("Audio Ready.");
+        setIsReady(true); // Enable buttons
       }
 
     } catch (err) {
       console.error("Failed to initialize AudioContext:", err);
       showError("AudioContext not supported or initialization failed.");
+      setIsReady(false);
     } finally {
       isInitializingAudio.current = false;
     }
   }, [audioContext, updateStatus, log, showError]);
-
-  // Helper to load worklet and create player
-  const loadWorkletAndPlayer = useCallback(async (context: AudioContext) => {
-    if (!context || context.state !== 'running') {
-      log("Cannot load worklet/player, context not running.", "warn");
-      return;
-    }
-    try {
-      log(`Loading AudioWorklet processor from: ${AUDIO_WORKLET_PROCESSOR_URL}`);
-      await context.audioWorklet.addModule(AUDIO_WORKLET_PROCESSOR_URL);
-      log("AudioWorklet module added successfully.");
-
-      // Example: Create worklet node (if needed, otherwise can be omitted)
-      const workletNodeInstance = new AudioWorkletNode(context, 'audio-worklet-processor');
-      setAudioWorkletNode(workletNodeInstance);
-      log("AudioWorkletNode created.");
-
-      // Instantiate AudioPlayer
-      const player = new AudioPlayer(context, workletNodeInstance, updateStatus, log, showError);
-      setAudioPlayer(player);
-      updateStatus("Audio system ready."); // Final status update
-      setIsReady(true); // Enable buttons fully now
-
-    } catch (err) {
-      console.error("Failed to load AudioWorklet or create AudioPlayer:", err);
-      showError(`Failed to load audio processor: ${err}`);
-      setIsReady(false); // Keep buttons disabled if audio fails
-    }
-  }, [updateStatus, log, showError]);
 
   // Handle WebSocket message parsing for STT
   const handleWebSocketMessage = useCallback((event: MessageEvent) => {
@@ -267,12 +431,14 @@ export default function Home() {
     // Handle binary messages (audio data)
     if (audioPlayer && event.data instanceof Blob) {
       log("[WS] Received binary message (Blob)", "debug");
-      event.data.arrayBuffer().then(buffer => {
-        audioPlayer.processAudioData(buffer);
-      }).catch(err => {
-        console.error("Error reading Blob data:", err);
-        showError("Error processing received audio data.");
-      });
+      // Use streaming processing for lower latency
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (reader.result instanceof ArrayBuffer) {
+          audioPlayer.processAudioData(reader.result);
+        }
+      };
+      reader.readAsArrayBuffer(event.data);
       return;
     }
     
@@ -280,7 +446,7 @@ export default function Home() {
     if (typeof event.data === 'string') {
       log(`[WS] Received text message: ${event.data}`, "debug");
       try {
-        const messageData = JSON.parse(event.data);
+        const messageData = JSON.parse(event.data) as WSMessage;
         
         switch (messageData.type) {
           case 'init':
@@ -302,7 +468,7 @@ export default function Home() {
             
           case 'transcription':
             // Example: Add to messages state
-            setMessages(prev => [...prev, { type: 'bot', text: messageData.text }]);
+            setMessages(prev => [...prev, { type: 'bot', text: (messageData as any).text }]);
             break;
             
           case 'error':
@@ -320,82 +486,47 @@ export default function Home() {
     }
   }, [audioPlayer, log, showError]);
 
-  // Update the WebSocket connection useEffect to use handleWebSocketMessage
+  // Use our custom WebSocket hook with reconnection
+  const wsUrl = process.env.NEXT_PUBLIC_WS_URL || `ws://localhost:8000/ws`;
+  const { wsRef: connectionWsRef, wsState: connectionState, reconnect } = useWebSocketWithReconnect(
+    wsUrl,
+    handleWebSocketMessage
+  );
+
+  // Update based on connection state
   useEffect(() => {
-    let wsInstance: WebSocket | null = null;
-
-    const connectWebSocket = async () => {
-      updateStatus('Connecting to server...');
-      const wsUrl = `ws://localhost:8000/ws`; // Point to the Rust backend port
-      log(`Attempting to connect WebSocket: ${wsUrl}`);
-      setIsReady(false); // Disable buttons while connecting
-
-      try {
-        wsInstance = new WebSocket(wsUrl);
-        // Assign handlers *before* setting state
-        wsInstance.onopen = () => {
-          log("WebSocket connection established.");
-          updateStatus('Connection successful. Initializing audio...');
-          setWebSocket(wsInstance);
-          initializeAudio(); // Initialize audio *after* connection opens
-        };
-
-        wsInstance.onmessage = handleWebSocketMessage;
-
-        wsInstance.onerror = (event) => {
-          console.error("WebSocket error:", event);
-          showError("WebSocket connection error.");
-          setWebSocket(null); // Clear WS state on error
-          setIsReady(false);
-        };
-
-        wsInstance.onclose = (event) => {
-          log(`WebSocket connection closed: Code=${event.code}, Reason=${event.reason}`);
-          if (webSocket) { // Only update status if it wasn't an error/initial fail
-            updateStatus("Connection closed.");
-          }
-          setWebSocket(null);
-          setIsReady(false);
-          setAudioPlayer(null); // Clear player on disconnect
-          setAudioContext(null); // Clear context
-          setAudioWorkletNode(null);
-          // TODO: Add reconnection logic if desired
-        };
-
-      } catch (err) {
-        console.error("WebSocket connection failed:", err);
-        showError("Failed to establish WebSocket connection.");
+    // Update UI based on connection state
+    switch (connectionState) {
+      case 'connecting':
+        updateStatus('Connecting to server...');
         setIsReady(false);
-      }
-    };
+        break;
+      case 'connected':
+        updateStatus('Connection successful. Initializing audio...');
+        initializeAudio();
+        setWebSocket(connectionWsRef.current);
+        break;
+      case 'disconnected':
+        updateStatus('Connection closed.');
+        setIsReady(false);
+        setIsRecording(false);
+        setIsSttProcessing(false);
+        setIsPlayingTts(false);
+        break;
+      case 'reconnecting':
+        updateStatus('Attempting to reconnect...');
+        setIsReady(false);
+        break;
+    }
+  }, [connectionState, updateStatus, initializeAudio]);
 
-    connectWebSocket();
-
-    // Cleanup function
-    return () => {
-      if (wsInstance && wsInstance.readyState === WebSocket.OPEN) {
-        log("Closing WebSocket connection.");
-        wsInstance.close(1000, "Client disconnecting");
-      }
-      if (audioContext && audioContext.state !== 'closed') {
-        log("Closing AudioContext.");
-        audioContext.close();
-      }
-      setWebSocket(null);
-      setAudioContext(null);
-      setAudioPlayer(null);
-      setAudioWorkletNode(null);
-      setIsReady(false);
-    };
-  }, [handleWebSocketMessage, initializeAudio, log, updateStatus, showError]); // Add handleWebSocketMessage to dependencies
-
-  // --- Send Message Function ---
-  const sendWebSocketMessage = useCallback((message: object) => {
-    if (webSocket && webSocket.readyState === WebSocket.OPEN) {
+  // --- Send Message Function (moved outside useEffect for clarity) ---
+  const sendWebSocketMessage = useCallback((message: WSMessage) => {
+    if (connectionWsRef.current && connectionWsRef.current.readyState === WebSocket.OPEN) {
       try {
         const messageString = JSON.stringify(message);
-        log(`[WS] Sending message: ${messageString}`, "debug");
-        webSocket.send(messageString);
+        log(`[WS] Sending: ${messageString}`, "debug");
+        connectionWsRef.current.send(messageString);
       } catch (e) {
         console.error("Failed to send WebSocket message:", e);
         showError(`Failed to send message: ${e}`);
@@ -403,8 +534,146 @@ export default function Home() {
     } else {
       showError('Error: WebSocket connection not ready or lost.');
       log('WebSocket is not open. Cannot send message.', 'error');
+      
+      // Attempt reconnection if disconnected
+      if (connectionState === 'disconnected') {
+        reconnect();
+      }
     }
-  }, [webSocket, log, showError]); // Dependency: webSocket state
+  }, [log, showError, connectionState, reconnect]);
+
+  // --- Recording Logic (moved stopRecording before startRecording) ---
+  const stopRecording = useCallback(() => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.stream) {
+      mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop()); // Stop mic access
+      console.log('Microphone access stopped.');
+    }
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      // Send stop message to the AudioWorklet
+      if (processorRef.current.port) {
+        processorRef.current.port.postMessage({ type: 'stop' });
+      }
+      processorRef.current = null;
+      console.log('AudioWorkletNode disconnected.');
+    }
+
+    setIsRecording(false);
+    setIsSttProcessing(false); // Reset STT status
+    console.log('Recording stopped');
+
+    // Send EndSpeech signal
+    if (connectionWsRef.current && connectionWsRef.current.readyState === WebSocket.OPEN) {
+      const endSpeechMsg: WSEndSpeech = {
+        type: 'EndSpeech'
+      };
+      connectionWsRef.current.send(JSON.stringify(endSpeechMsg));
+      console.log('Sent EndSpeech signal');
+    }
+  }, []); // Empty dependency array since it only uses refs
+
+  const startRecording = useCallback(async () => {
+    const currentAudioContext = audioContextRef.current; // Capture ref value
+    const currentWs = connectionWsRef.current; // Capture ref value
+
+    if (!currentAudioContext) { showError("Audio system not ready."); return; }
+    if (currentAudioContext.state === 'suspended') { 
+      try { 
+        await currentAudioContext.resume(); 
+      } catch (error: unknown) { 
+        showError("Failed to resume audio."); 
+        return; 
+      } 
+    }
+    if (currentAudioContext.state !== 'running') { showError("Audio context not running."); return; }
+    if (!currentWs || currentWs.readyState !== WebSocket.OPEN) { showError('Server connection not ready.'); return; }
+    if (isRecording) { log("Already recording.", "warn"); return; }
+
+    // Ensure resources are clean before starting
+    stopRecording(); 
+    await new Promise(resolve => setTimeout(resolve, 50)); // Small delay
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      micStreamRef.current = stream;
+      mediaRecorderRef.current = new MediaRecorder(stream); // Store dummy recorder for stream track access
+
+      if (!audioContextRef.current) throw new Error("AudioContext lost after getting stream"); // Re-check
+
+      // Add AudioWorklet module 
+      try {
+        await audioContextRef.current.audioWorklet.addModule(AUDIO_WORKLET_PROCESSOR_URL);
+        log("AudioWorklet module loaded.");
+      } catch (error: unknown) { 
+        // Handle case where module is already loaded
+        if (!(error instanceof Error) || !error.message.includes('already been loaded')) {
+          console.error('Worklet load err:', error); 
+          showError('Audio processor fail.'); 
+          stream.getTracks().forEach(track => track.stop()); 
+          micStreamRef.current=null; 
+          return; 
+        }
+      }
+
+      const source = audioContextRef.current.createMediaStreamSource(stream);
+      const workletNode = new AudioWorkletNode(audioContextRef.current, 'audio-processor', {
+        processorOptions: {
+          bufferSize: AUDIO_BUFFER_SIZE,
+          targetSampleRate: TARGET_SAMPLE_RATE,
+          sourceSampleRate: audioContextRef.current.sampleRate
+        }
+      });
+      
+      processorRef.current = workletNode;
+
+      // Setup message port with proper typing
+      workletNode.port.onmessage = (event: MessageEvent) => {
+        if (connectionWsRef.current?.readyState === WebSocket.OPEN) {
+          // The AudioWorklet sends Float32Array data
+          const audioData = event.data;
+          
+          const message: WSAudioData = {
+            type: 'AudioData', 
+            data: Array.from(audioData instanceof Float32Array ? audioData : new Float32Array(0)), 
+            sampleRate: audioContextRef.current?.sampleRate || TARGET_SAMPLE_RATE,
+            request_codes: false
+          };
+          sendWebSocketMessage(message);
+        } else {
+          if (isRecording) { 
+            log("WebSocket closed during recording, stopping worklet processing.", "warn");
+            stopRecording(); 
+          }
+        }
+      };
+
+      // Add proper error handler
+      workletNode.onprocessorerror = (event) => { 
+        console.error("AudioWorkletProcessor error:", event);
+        showError("Audio processing error."); 
+        stopRecording();
+      };
+
+      // Connect nodes with null checks
+      if (source && workletNode && currentAudioContext) {
+        source.connect(workletNode);
+        workletNode.connect(currentAudioContext.destination);
+        log("Audio nodes connected.");
+      }
+      
+      setIsRecording(true);
+      setTranscript('');
+      setPartialTranscript('');
+      updateStatus('Listening...');
+      log('Recording started successfully');
+
+    } catch (error) {
+      console.error('Start recording error:', error);
+      showError(`Mic start fail: ${error instanceof Error ? error.message : String(error)}`);
+      setIsRecording(false);
+      stopRecording();
+    }
+  }, [isRecording, log, updateStatus, showError, sendWebSocketMessage, stopRecording]); // Dependencies for useCallback
 
   // Toggle microphone function for STT
   const toggleMicrophone = useCallback(async () => {
@@ -446,49 +715,52 @@ export default function Home() {
         // Create a source from the microphone stream
         const source = audioContext.createMediaStreamSource(micStreamRef.current);
         
-        // Create a script processor for processing audio data
-        processorRef.current = audioContext.createScriptProcessor(4096, 1, 1);
-        
-        // Process audio data
-        processorRef.current.onaudioprocess = (e) => {
-          if (!isMicActive || !webSocket || webSocket.readyState !== WebSocket.OPEN) return;
-          
-          const inputData = e.inputBuffer.getChannelData(0);
-          
-          // Resample to 24kHz if needed (simple linear interpolation)
-          let data: Float32Array;
-          if (audioContext?.sampleRate !== 24000) {
-            const ratio = 24000 / audioContext.sampleRate;
-            const newLength = Math.floor(inputData.length * ratio);
-            data = new Float32Array(newLength);
-            
-            for (let i = 0; i < newLength; i++) {
-              const srcIdx = i / ratio;
-              const srcIdxFloor = Math.floor(srcIdx);
-              const srcIdxCeil = Math.ceil(srcIdx);
-              
-              if (srcIdxCeil >= inputData.length) {
-                data[i] = inputData[srcIdxFloor];
-              } else {
-                const t = srcIdx - srcIdxFloor;
-                data[i] = inputData[srcIdxFloor] * (1 - t) + inputData[srcIdxCeil] * t;
-              }
-            }
-          } else {
-            data = inputData;
+        // Try to load AudioWorklet if not already loaded
+        try {
+          await audioContext.audioWorklet.addModule(AUDIO_WORKLET_PROCESSOR_URL);
+        } catch (error: unknown) {
+          // Ignore already loaded errors
+          if (!(error instanceof Error) || !error.message?.includes('already been loaded')) {
+            throw error;
           }
+        }
+        
+        // Create AudioWorkletNode with optimized buffer size
+        processorRef.current = new AudioWorkletNode(audioContext, 'audio-processor', {
+          processorOptions: {
+            bufferSize: AUDIO_BUFFER_SIZE,
+            sampleRate: audioContext.sampleRate,
+            targetSampleRate: TARGET_SAMPLE_RATE
+          }
+        });
+        
+        // Process audio data with proper typing
+        processorRef.current.port.onmessage = (e: MessageEvent<AudioWorkletMessage>) => {
+          if (!connectionWsRef.current || connectionWsRef.current.readyState !== WebSocket.OPEN) return;
           
-          // Send the audio data to the server
-          sendWebSocketMessage({
-            type: 'audio_data',
-            data: Array.from(data),
-            sample_rate: 24000
-          });
+          // Send audio data to the server with proper typing
+          const audioData: WSAudioData = {
+            type: 'AudioData',
+            data: Array.from(e.data.data),
+            sampleRate: TARGET_SAMPLE_RATE,
+            request_codes: false
+          };
+          
+          sendWebSocketMessage(audioData);
         };
         
-        // Connect the processor
-        source.connect(processorRef.current);
-        processorRef.current.connect(audioContext.destination);
+        // Add error handler
+        processorRef.current.onprocessorerror = (event) => {
+          console.error('Audio processing error:', event);
+          showError("Audio processing error.");
+          stopRecording();
+        };
+        
+        // Connect the processor with null checks
+        if (processorRef.current) {
+          source.connect(processorRef.current);
+          processorRef.current.connect(audioContext.destination);
+        }
         
         setIsMicActive(true);
         updateStatus('Microphone active');
@@ -497,7 +769,7 @@ export default function Home() {
         showError(`Microphone error: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
-  }, [isMicActive, audioContext, webSocket, sendWebSocketMessage, updateStatus, showError]);
+  }, [isMicActive, audioContext, connectionWsRef, sendWebSocketMessage, updateStatus, showError, stopRecording]);
 
   // Function to clear the transcript
   const clearTranscript = useCallback(() => {
@@ -507,7 +779,7 @@ export default function Home() {
 
   // --- Event Handlers ---
   const handleSynthesize = useCallback(() => {
-    if (!isReady || !webSocket) {
+    if (!isReady || !connectionWsRef.current) {
       showError("Not connected, cannot synthesize.");
       return;
     }
@@ -515,10 +787,12 @@ export default function Home() {
     if (text) {
       log(`Synthesizing text: ${text}`);
       sendWebSocketMessage({
-        type: 'synthesize',
+        type: 'Synthesize',
         text: text,
-        character: activeCharacter // Send selected character
-      });
+        character: activeCharacter, // Send selected character
+        emotion: null,
+        style: null
+      } as WSMessage);
       // Example: Add user message to display
       // setMessages(prev => [...prev, { type: 'user', text: text }]);
       // Clear input after sending?
@@ -526,7 +800,7 @@ export default function Home() {
     } else {
       showError('Please enter text to synthesize.');
     }
-  }, [isReady, webSocket, textInputValue, activeCharacter, sendWebSocketMessage, log, showError]);
+  }, [isReady, connectionWsRef, textInputValue, activeCharacter, sendWebSocketMessage, log, showError]);
 
   const handleStopAudio = useCallback(() => {
     if (audioPlayer) {
@@ -536,7 +810,94 @@ export default function Home() {
     }
   }, [audioPlayer]);
 
-  // TODO: Implement handleStartConversation, handleStopConversation
+  // --- Web Audio API Setup & Playback ---
+  const playAudioQueue = useCallback(async () => {
+    if (!audioContext || isPlaying || audioQueue.length === 0) {
+      return;
+    }
+
+    setIsPlaying(true);
+    const currentAudioContext = audioContext;
+    let nextStartTime = currentAudioContext.currentTime;
+
+    // Process the entire queue at once for smoother playback
+    const queueToPlay = [...audioQueue];
+    setAudioQueue([]); // Clear the queue immediately
+
+    try {
+      // Combine all queued Float32Arrays into one
+      let totalLength = queueToPlay.reduce((sum, arr) => sum + arr.length, 0);
+      if (totalLength === 0) {
+        setIsPlaying(false);
+        return;
+      }
+
+      const combinedData = new Float32Array(totalLength);
+      let offset = 0;
+      for (const chunk of queueToPlay) {
+        combinedData.set(chunk, offset);
+        offset += chunk.length;
+      }
+
+      const buffer = currentAudioContext.createBuffer(
+        1, // num channels (mono)
+        combinedData.length, // length
+        24000 // sample rate (assuming 24kHz from backend)
+      );
+      buffer.copyToChannel(combinedData, 0); // Fill buffer
+
+      const source = currentAudioContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(currentAudioContext.destination);
+
+      source.onended = () => {
+        setIsPlaying(false);
+        // Check if more audio arrived while playing
+        // This check is now less critical as we process the whole queue
+        // but kept for potential edge cases or future streaming improvements
+        if (audioQueue.length > 0) {
+          console.log('More audio arrived, restarting playback...');
+          // Debounce or simply recall playAudioQueue
+          setTimeout(playAudioQueue, 50); // Small delay
+        }
+      };
+      
+      source.start(nextStartTime);
+      sourceNode.current = source; // Store the source node
+
+    } catch (error) {
+      console.error('Error playing audio:', error);
+      setIsPlaying(false);
+      setAudioQueue([]); // Clear queue on error
+    }
+  }, [audioQueue, isPlaying]);
+
+  // Trigger playback when the queue has items and not already playing
+  useEffect(() => {
+    if (audioQueue.length > 0 && !isPlaying) {
+      playAudioQueue();
+    }
+  }, [audioQueue, isPlaying, playAudioQueue]);
+
+  // --- TTS Send Logic ---
+  const handleSynthesizeTts = () => {
+    if (!ttsInput.trim()) {
+      alert('Please enter text to synthesize.');
+      return;
+    }
+    if (connectionWsRef.current && connectionWsRef.current.readyState === WebSocket.OPEN) {
+      log('Sending Synthesize message:', 'info');
+      sendWebSocketMessage({
+        type: 'Synthesize',
+        text: ttsInput,
+        emotion: null,
+        style: null
+      } as WSSynthesize);
+      // Optionally clear input: setTtsInput(''); 
+    } else {
+      alert('WebSocket not connected. Cannot send synthesis request.');
+    }
+  };
 
   // --- JSX Structure ---
   return (
