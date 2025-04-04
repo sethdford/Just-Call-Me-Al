@@ -11,6 +11,8 @@ pub mod server;
 pub mod utils;
 pub mod tokenization;
 pub mod rvq;
+pub mod context;
+pub mod llm_integration;
 
 // Ensure ONLY CSMModel is re-exported here
 pub use models::{CSMModel};
@@ -19,6 +21,8 @@ pub use models::{CSMModel};
 pub use audio::{AudioProcessor, AudioStream};
 pub use rvq::{RVQEncoder, RVQDecoder, RVQConfig};
 pub use tokenization::{Tokenizer, TokenizerConfig, LlamaTokenizer};
+pub use context::{ConversationHistory, ConversationTurn, Speaker};
+pub use llm_integration::{LlmProcessor, LlmConfig, LlmType, create_llm_service, ContextEmbedding};
 
 // Re-export anyhow for error handling
 pub use anyhow;

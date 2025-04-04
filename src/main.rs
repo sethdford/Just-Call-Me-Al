@@ -23,6 +23,12 @@ use serde_json::{self, json};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 
+// Project modules
+mod context; // Add context module
+mod llm_integration; // Add LLM integration module
+use context::ConversationHistory; // Import the history struct
+use llm_integration::{LlmProcessor, LlmConfig, LlmType, create_llm_service}; // Import LLM types
+
 // Axum imports
 use axum::{
     extract::{
@@ -65,12 +71,18 @@ struct Config {
     mimi_model_path: String,
     #[serde(default = "default_asr_delay")]
     asr_delay_in_tokens: usize,
+    #[serde(default = "default_llm_type")]
+    llm_type: String,
+    #[serde(default = "default_llm_model_path")]
+    llm_model_path: String,
 }
 
 fn default_moshi_model_path() -> String { "models/moshi/language_model.safetensors".to_string() }
 fn default_tokenizer_path() -> String { "models/moshi/tokenizer.model".to_string() }
 fn default_mimi_model_path() -> String { "models/mimi/model.safetensors".to_string() }
 fn default_asr_delay() -> usize { 6 }
+fn default_llm_type() -> String { "mock".to_string() }
+fn default_llm_model_path() -> String { "models/llm/model.safetensors".to_string() }
 
 // Application State
 #[derive(Clone)]
@@ -78,6 +90,11 @@ struct AppState {
     csm_model: Arc<CSMImpl>,
     vocoder: Arc<Box<dyn Vocoder + Send + Sync>>,
     speech_model: Option<Arc<MoshiSpeechModel>>,
+    llm_processor: Arc<dyn LlmProcessor>,
+    // Note: AppState is typically shared. For per-connection state like history,
+    // it's better managed within the WebSocket handler (handle_socket).
+    // Leaving this commented out as a design note.
+    // conversation_history: Arc<TokioMutex<ConversationHistory>>, // Use Mutex for shared state
 }
 
 // WebSocket Message Types
@@ -206,11 +223,46 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Initialize LLM processor
+    let llm_config = match config.llm_type.to_lowercase().as_str() {
+        "llama" => LlmConfig {
+            llm_type: LlmType::Llama,
+            model_path: Some(args.model_dir.join(&config.llm_model_path)),
+            use_gpu: device != Device::Cpu,
+            embedding_dim: 768,
+            ..Default::default()
+        },
+        "mistral" => LlmConfig {
+            llm_type: LlmType::Mistral,
+            model_path: Some(args.model_dir.join(&config.llm_model_path)),
+            use_gpu: device != Device::Cpu,
+            embedding_dim: 1024,
+            ..Default::default()
+        },
+        "local" => LlmConfig {
+            llm_type: LlmType::Local,
+            model_path: Some(args.model_dir.join(&config.llm_model_path)),
+            use_gpu: device != Device::Cpu,
+            embedding_dim: 768,
+            ..Default::default()
+        },
+        _ => {
+            info!("Using mock LLM processor for development");
+            LlmConfig::default() // Uses Mock LLM type
+        }
+    };
+    
+    let llm_processor = create_llm_service(llm_config)
+        .map_err(|e| anyhow!("Failed to initialize LLM processor: {}", e))?;
+    info!("LLM processor initialized.");
+
     // Create application state
     let app_state = Arc::new(AppState {
         csm_model,
         vocoder,
         speech_model,
+        llm_processor,
+        // conversation_history: Arc::new(TokioMutex::new(ConversationHistory::new(None))), // Initialize shared history if needed
     });
 
     // Setup router
@@ -235,234 +287,201 @@ async fn main() -> Result<()> {
 
 // Route Handlers
 async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+    info!("WebSocket connection upgrade requested");
+    ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
 // WebSocket Handler
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
     let session_id = Uuid::new_v4();
-    info!(session_id = %session_id, "WebSocket client connected");
-    let (sender, mut receiver) = socket.split();
-    let sender = Arc::new(TokioMutex::new(sender));
+    info!("New WebSocket connection: {}", session_id);
 
-    // Track if the client wants audio codes
-    let request_codes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // --- Per-Connection State --- 
+    let mut conversation_history = ConversationHistory::new(None); // Each connection gets its own history
+    let mut current_asr_stream: Option<mpsc::Sender<Vec<f32>>> = None;
+    let mut current_asr_task: Option<tokio::task::JoinHandle<Result<STTOutput, SpeechModelError>>> = None;
 
-    // Check if Speech model (and thus STT) is available
-    let stt_available = state.speech_model.is_some();
-    let speech_model_instance = state.speech_model.clone(); // Clone Option<Arc<MoshiSpeechModel>>
+    // Send initial info message
+    let _ = socket.send(Message::Text(serde_json::to_string(&ServerMessage::Info {
+        message: "Connection established".to_string()
+    }).unwrap())).await;
 
-    // Create channels for STT if available
-    let (audio_tx, text_rx_option): (
-        Option<mpsc::Sender<Vec<f32>>>,
-        Option<mpsc::Receiver<Result<Vec<STTOutput>, SpeechModelError>>> // Re-apply explicit type annotation
-    ) = if stt_available {
-        if let Some(model) = &speech_model_instance {
-            match model.start_streaming(24000) { // Call on MoshiSpeechModel
-                Ok((tx, rx)) => (Some(tx), Some(rx)),
-                Err(e) => {
-                    error!("Failed to start STT streaming: {}", e);
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        }
-    } else {
-        (None, None)
-    };
+    // --- Message Loop --- 
+    while let Some(msg) = socket.recv().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                info!("Received text message from {}: {}", session_id, text);
+                match serde_json::from_str::<ClientMessageType>(&text) {
+                    Ok(client_msg) => {
+                        match client_msg {
+                            ClientMessageType::Synthesize { text, emotion, style } => {
+                                info!("Synthesis request: '{}' (Emotion: {:?}, Style: {:?})", text, emotion, style);
 
-    // Send initial message
-    let init_msg = serde_json::to_string(&ServerMessage::Info { message: format!("Connected. STT Available: {}", stt_available) }).unwrap();
-    if let Err(e) = sender.lock().await.send(Message::Text(init_msg)).await {
-        error!("Error sending initial message: {}", e);
-        return;
-    }
+                                // 1. Add current user turn to history
+                                let user_turn = context::ConversationTurn::new(context::Speaker::User, text.clone());
+                                conversation_history.add_turn(user_turn);
 
-    // Clone sender and state for various tasks
-    let sender_for_stt = sender.clone();
-    let request_codes_for_stt = request_codes.clone();
-    let sender_for_receiver = sender.clone();
-    let state_for_receiver = state.clone(); // Clone state for receiver loop
-    let audio_tx_for_receiver = audio_tx.clone(); // Clone audio_tx for receiver loop
+                                // 2. Use LLM to generate a contextual response
+                                let llm_response = match state.llm_processor.generate_response(&conversation_history) {
+                                    Ok(response) => {
+                                        info!("LLM generated response: {}", response);
+                                        response
+                                    },
+                                    Err(e) => {
+                                        error!("LLM response generation failed: {}", e);
+                                        format!("Sorry, I couldn't process that correctly. Error: {}", e)
+                                    }
+                                };
 
-    // Spawn STT output processing task
-    let stt_task = if let Some(mut rx) = text_rx_option { // Take ownership of rx
-        Some(tokio::spawn(async move {
-            while let Some(result) = rx.recv().await {
-                match result {
-                    Ok(outputs) => {
-                        // Iterate through the Vec<STTOutput>
-                        for output in outputs {
-                            // Access fields directly from the STTOutput struct
-                            let transcript_msg = ServerMessage::Transcript {
-                                text: output.word.text,
-                                start_time: output.word.start_time,
-                                stop_time: output.word.stop_time,
-                                // Omit audio_codes for now
-                            };
+                                // 3. Use LLM to generate contextual embeddings
+                                let _contextual_embedding = match state.llm_processor.generate_embeddings(&conversation_history) {
+                                    Ok(embedding) => {
+                                        info!("Generated contextual embedding with dimension {}", embedding.dim());
+                                        Some(embedding)
+                                    },
+                                    Err(e) => {
+                                        error!("Contextual embedding generation failed: {}", e);
+                                        None
+                                    }
+                                };
 
-                            if let Ok(json_msg) = serde_json::to_string(&transcript_msg) {
-                                let mut guard = sender_for_stt.lock().await;
-                                if let Err(e) = guard.send(Message::Text(json_msg)).await {
-                                    error!(session_id = %session_id, "Error sending STT transcript message: {}", e);
-                                    break; // Exit loop on send error
+                                // 4. Pass LLM response and contextual embedding to the model
+                                // For now, we'll just use a placeholder response
+                                
+                                // --- Placeholder Synthesis Logic --- 
+                                let sample_rate = state.vocoder.sample_rate();
+                                let placeholder_audio: Vec<f32> = vec![0.1; (sample_rate / 4) as usize];
+                                
+                                info!("Sending placeholder synthesized audio...");
+                                let send_result = socket.send(Message::Binary(placeholder_audio.iter().flat_map(|f| f.to_le_bytes()).collect())).await;
+                                if let Err(e) = send_result {
+                                    warn!("Failed to send placeholder audio: {}", e);
+                                    break;
                                 }
-                            } else {
-                                error!(session_id = %session_id, "Failed to serialize STT transcript message");
+
+                                // 5. Add model turn to history with the LLM-generated response
+                                let model_turn = context::ConversationTurn::new(context::Speaker::Model, llm_response);
+                                conversation_history.add_turn(model_turn);
+                            },
+                            ClientMessageType::AudioData { data, sample_rate, request_codes } => {
+                                // Handle incoming audio for STT (if speech_model exists)
+                                if let Some(speech_model) = state.speech_model.as_ref() {
+                                    // If no ASR stream exists, create one
+                                    if current_asr_stream.is_none() {
+                                        let (tx, rx) = mpsc::channel(100); // Buffer size
+                                        current_asr_stream = Some(tx);
+                                        
+                                        let model_clone = Arc::clone(speech_model);
+                                        let mut history_clone = conversation_history.clone(); // Clone history for the task
+
+                                        current_asr_task = Some(tokio::spawn(async move {
+                                            info!("Starting ASR task...");
+                                            // TODO: Pass conversation history to transcribe_stream
+                                            let result = model_clone.transcribe_stream(rx).await;
+                                            info!("ASR task finished: {:?}", result);
+                                            
+                                            // Add transcript to history if successful
+                                            if let Ok(stt_output) = &result {
+                                                if !stt_output.full_transcript.is_empty() {
+                                                     history_clone.add_turn(context::ConversationTurn::new(
+                                                         context::Speaker::User, 
+                                                         stt_output.full_transcript.clone()
+                                                     ));
+                                                    // TODO: We might need a way to update the history owned by the main task here.
+                                                    // Using Arc<Mutex<History>> shared between tasks is one option.
+                                                }
+                                            }
+                                            result
+                                        }));
+
+                                        // Send partial transcripts back to client
+                                        // TODO: Need a way to receive partial results from transcribe_stream
+                                        // let partial_rx = ... // Get receiver for partial transcripts
+                                        // tokio::spawn(async move {
+                                        //     while let Some(partial) = partial_rx.recv().await {
+                                        //         let _ = socket.send(... ServerMessage::PartialTranscript ...).await;
+                                        //     }
+                                        // });
+                                    }
+
+                                    // Send audio data to the ASR stream
+                                    if let Some(tx) = &current_asr_stream {
+                                        if let Err(e) = tx.send(data).await {
+                                            error!("Failed to send audio to ASR stream: {}", e);
+                                            // Close the stream and maybe reset state
+                                            current_asr_stream = None;
+                                            current_asr_task = None;
+                                        }
+                                    }
+                                } else {
+                                    warn!("Received audio data but no speech model configured/loaded.");
+                                }
                             }
-                            
-                            // TODO: Decide if/how to handle SpeechEnded/PartialTranscript if Moshi provides them via STTOutput 
-                            // The current STTOutput struct only has 'word' and 'audio_codes'.
-                            // If Moshi signals the end via an empty Vec or a specific error, 
-                            // that logic should be handled outside this inner loop.
+                            ClientMessageType::EndSpeech => {
+                                info!("Received EndSpeech signal.");
+                                // Close the ASR stream sender to signal the end
+                                if let Some(tx) = current_asr_stream.take() {
+                                    drop(tx); // Dropping sender closes the channel
+                                    info!("ASR stream sender dropped.");
+                                }
+                                // Wait for the ASR task to finish and get the final transcript
+                                if let Some(task) = current_asr_task.take() {
+                                    match task.await {
+                                        Ok(Ok(stt_output)) => {
+                                            info!("Final Transcript: {}", stt_output.full_transcript);
+                                             // Send final transcript
+                                            let _ = socket.send(Message::Text(serde_json::to_string(&ServerMessage::Transcript {
+                                                 text: stt_output.full_transcript, // Send full transcript
+                                                 start_time: stt_output.start_time, // Use times from STTOutput
+                                                 stop_time: stt_output.stop_time,
+                                             }).unwrap())).await;
+                                            // History update should happen inside the task or via shared state
+                                        }
+                                        Ok(Err(e)) => error!("ASR task failed: {}", e),
+                                        Err(e) => error!("ASR task join error: {}", e),
+                                    }
+                                }
+                                let _ = socket.send(Message::Text(serde_json::to_string(&ServerMessage::SpeechEnded).unwrap())).await;
+                            }
+                            ClientMessageType::RequestReset => {
+                                info!("Received RequestReset signal.");
+                                // Reset conversation history
+                                conversation_history.clear();
+                                // Reset ASR state
+                                if let Some(tx) = current_asr_stream.take() { drop(tx); }
+                                if let Some(task) = current_asr_task.take() { task.abort(); }
+                                let _ = socket.send(Message::Text(serde_json::to_string(&ServerMessage::Info { message: "State reset".to_string() }).unwrap())).await;
+                                info!("Conversation state reset for {}", session_id);
+                            }
                         }
                     }
                     Err(e) => {
-                        error!(session_id = %session_id, "Error receiving STT output: {}", e);
-                        let error_resp = ServerMessage::Error { message: format!("STT Processing Error: {}", e) };
-                        if let Ok(err_json) = serde_json::to_string(&error_resp) {
-                           let mut guard = sender_for_stt.lock().await;
-                           let _ = guard.send(Message::Text(err_json)).await; // Ignore error
-                        }
-                        break; // Stop processing on error
+                        warn!("Failed to parse client message: {}, message: {}", e, text);
+                        let _ = socket.send(Message::Text(serde_json::to_string(&ServerMessage::Error {
+                            message: format!("Invalid message format: {}", e)
+                        }).unwrap())).await;
                     }
                 }
             }
-            info!(session_id = %session_id, "STT receiver task finished");
-        }))
-    } else {
-        None
-    };
-
-    // Receive loop
-    let receive_task = tokio::spawn(async move {
-        while let Some(msg) = receiver.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    match serde_json::from_str::<ClientMessageType>(&text) {
-                        Ok(ClientMessageType::AudioData { data, sample_rate, request_codes: req_codes }) => {
-                             request_codes_for_stt.store(req_codes, std::sync::atomic::Ordering::Relaxed);
-                            if let Some(ref tx) = audio_tx_for_receiver {
-                                if sample_rate != 24000 {
-                                    warn!(session_id = %session_id, "Received audio with unexpected sample rate: {}, expected 24000", sample_rate);
-                                    // TODO: Add resampling if needed
-                                    continue;
-                                }
-                                if tx.send(data).await.is_err() {
-                                    error!(session_id = %session_id, "Audio channel closed, cannot send audio data.");
-                                    break;
-                                }
-                            } else {
-                                warn!(session_id = %session_id, "Received audio data, but STT is not available.");
-                            }
-                        },
-                        Ok(ClientMessageType::Synthesize { text, .. }) => {
-                             info!(session_id = %session_id, "Received synthesize request for text: {}", text);
-                             if let Some(model) = &state_for_receiver.speech_model {
-                                 // Clone Arc for the synthesis task
-                                 let model_clone = model.clone();
-                                 let sender_clone = sender_for_receiver.clone();
-                                 let text_clone = text.clone(); // Clone text for the async block
-                                 let session_id_clone = session_id; // Clone session_id for the async block
-
-                                 tokio::spawn(async move {
-                                     info!(session_id = %session_id_clone, "Spawning TTS task for: {}", text_clone);
-                                     match model_clone.synthesize_audio(&text_clone, None, None, None).await {
-                                         Ok(audio_data) => {
-                                             info!(session_id = %session_id_clone, "TTS synthesis successful, sending audio ({} samples).", audio_data.len());
-                                             let response = ServerMessage::SynthesizedAudio { 
-                                                 data: audio_data, 
-                                                 sample_rate: 24000 // Assuming TTS output SR is 24kHz
-                                             };
-                                             if let Ok(json_msg) = serde_json::to_string(&response) {
-                                                let mut guard = sender_clone.lock().await;
-                                                if let Err(e) = guard.send(Message::Text(json_msg)).await {
-                                                    error!(session_id = %session_id_clone, "Failed to send synthesized audio: {}", e);
-                                                }
-                                             } else {
-                                                 error!(session_id = %session_id_clone, "Failed to serialize synthesized audio response.");
-                                             }
-                                         },
-                                         Err(e) => {
-                                             error!(session_id = %session_id_clone, "TTS synthesis failed: {}", e);
-                                             let error_resp = ServerMessage::Error { message: format!("TTS Synthesis failed: {}", e) };
-                                             if let Ok(err_json) = serde_json::to_string(&error_resp) {
-                                                let mut guard = sender_clone.lock().await;
-                                                let _ = guard.send(Message::Text(err_json)).await;
-                                             }
-                                         }
-                                     }
-                                     info!(session_id = %session_id_clone, "TTS task finished for: {}", text_clone);
-                                 });
-                             } else {
-                                 warn!(session_id = %session_id, "Received synthesize request, but TTS model is not available.");
-                                 let error_resp = ServerMessage::Error { message: "TTS functionality is not available.".to_string() };
-                                 if let Ok(err_json) = serde_json::to_string(&error_resp) {
-                                     let mut sender_guard = sender_for_receiver.lock().await;
-                                     let _ = sender_guard.send(Message::Text(err_json)).await;
-                                 }
-                             }
-                         },
-                        Ok(ClientMessageType::EndSpeech) => {
-                            info!(session_id = %session_id, "Received end_speech signal from client.");
-                            // Optionally signal the STT model or other components
-                            let end_msg = ServerMessage::SpeechEnded;
-                            let mut sender_guard = sender_for_receiver.lock().await;
-                            let _ = sender_guard.send(Message::Text(serde_json::to_string(&end_msg).unwrap())).await;
-                        },
-                        Ok(ClientMessageType::RequestReset) => {
-                            info!(session_id = %session_id, "Received reset signal from client.");
-                            if let Some(model) = &state_for_receiver.speech_model {
-                                model.reset().await;
-                                info!(session_id = %session_id, "Speech model state reset.");
-                                let reset_msg = ServerMessage::Info { message: "Model state reset.".to_string() };
-                                let mut sender_guard = sender_for_receiver.lock().await;
-                                let _ = sender_guard.send(Message::Text(serde_json::to_string(&reset_msg).unwrap())).await;
-                            } else {
-                                warn!(session_id = %session_id, "Received reset request, but speech model is not available.");
-                            }
-                        },
-                        Err(e) => {
-                             warn!(session_id = %session_id, raw_text = text, "Failed to parse client message: {}", e);
-                             let error_resp = ServerMessage::Error { message: format!("Invalid message format: {}", e) };
-                             if let Ok(err_json) = serde_json::to_string(&error_resp) {
-                                 let mut sender_guard = sender_for_receiver.lock().await;
-                                 let _ = sender_guard.send(Message::Text(err_json)).await;
-                             }
-                        }
-                    }
-                },
-                Ok(Message::Binary(data)) => {
-                    warn!(session_id = %session_id, "Received unexpected binary message ({} bytes), ignoring.", data.len());
-                },
-                Ok(Message::Close(_)) => {
-                    info!(session_id = %session_id, "Client requested close.");
-                    break;
-                },
-                Ok(Message::Ping(p)) => {
-                    let mut sender_guard = sender_for_receiver.lock().await;
-                    if sender_guard.send(Message::Pong(p)).await.is_err() {
-                        break; // Exit if pong fails
-                    }
-                },
-                Ok(Message::Pong(_)) => {
-                    // Pong received, do nothing
-                },
-                Err(e) => {
-                    error!(session_id = %session_id, "Error receiving message: {}", e);
-                    break;
-                }
+            Ok(Message::Binary(_)) => {
+                warn!("Received unexpected binary message from {}", session_id);
+            }
+            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => { /* Ignore */ }
+            Ok(Message::Close(_)) => {
+                info!("Client {} disconnected gracefully.", session_id);
+                break;
+            }
+            Err(e) => {
+                error!("WebSocket error for session {}: {}", session_id, e);
+                break;
             }
         }
-        info!(session_id = %session_id, "Receiver task finished.");
-    });
-
-    // Wait for tasks to complete (or abort if needed)
-    if let Some(task) = stt_task {
-        let _ = task.await; // Wait for STT task
     }
-    let _ = receive_task.await; // Wait for receiver task
 
-    info!(session_id = %session_id, "WebSocket client disconnected");
-} 
+    info!("Cleaning up WebSocket connection: {}", session_id);
+    // Ensure any running ASR task is cleaned up
+    if let Some(task) = current_asr_task { task.abort(); }
+}
+
+// Placeholder for static file handling (if needed beyond public dir)
+// async fn static_handler(uri: Uri) -> impl IntoResponse { ... } 
