@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 // Only declare modules that have corresponding files.
 pub mod config;
 pub mod csm;
+pub mod prosody;
 // Note: The moshi_speech_model module has been temporarily disabled
 // due to missing dependencies. The 'moshi' crate needs to be properly
 // imported or implemented to use this module. For now, we are focusing
@@ -32,6 +33,7 @@ mod csm_tests;
 pub use config::CsmModelConfig; // Example
 // pub use csm::RustCsmModel; // Removed duplicate/unnecessary export
 pub use csm::CSMImpl;      // Keep CSMImpl as the main export
+pub use prosody::{ProsodyControl, EmotionalTone, ProsodyGenerator, ProsodyIntegration};
 // Remove the example SafeTensor export if it's not defined
 // pub use tensor::SafeTensor; // Example
 // pub use moshi_speech_model::MoshiSpeechModel; // Temporarily commented out
@@ -63,6 +65,8 @@ pub enum ModelError {
     TokenizationError(String),
     #[error("Audio processing error: {0}")]
     AudioError(String),
+    #[error("Prosody control error: {0}")]
+    ProsodyError(String),
 
     // --- From implementations ---
     #[error("I/O error: {0}")]

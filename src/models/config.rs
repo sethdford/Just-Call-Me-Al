@@ -57,11 +57,19 @@ pub struct CsmModelConfig {
 
     #[serde(default)] // e.g., "llama", "mistral" - for potential weight name mapping
     pub pretrained_llm_backbone_type: Option<String>,
-    // --- End NEW Params ---
 
-    // LLM Integration Params
-    #[serde(default)] // Use default if not present in config.json
-    pub llm_embedding_dim: Option<i64>, // Optional dimension for incoming LLM embeddings
+    // Configuration for LLM backbone loading
+    /// Flag to indicate whether to load a pretrained LLM as the backbone
+    #[serde(default)]
+    pub llm_backbone_type: Option<String>,
+    
+    /// Path to safetensors file for pretrained LLM
+    #[serde(default)]
+    pub llm_safetensors_path: Option<String>,
+    
+    /// Embedding dimension for LLM context
+    #[serde(default)]
+    pub llm_embedding_dim: Option<i64>,
 
     // Synthesis Params (add defaults as needed)
     #[serde(default = "default_temperature")]

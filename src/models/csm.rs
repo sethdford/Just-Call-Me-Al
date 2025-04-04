@@ -7,7 +7,6 @@ use std::fs::File;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use memmap2::MmapOptions;
-use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
 // tch related
@@ -25,6 +24,7 @@ use crate::llm_integration::{LlmProcessor, ContextEmbedding, LlmConfig, create_l
 use crate::context::ConversationHistory;
 use crate::tokenization::{Tokenizer, LlamaTokenizer};
 use safetensors::{SafeTensors, tensor::TensorView};
+use crate::models::prosody::{ProsodyGenerator, ProsodyGeneratorConfig, ProsodyIntegration};
 
 const EOS_TOKEN_ID: i64 = 2; // Assuming standard EOS token ID for SentencePiece/Llama
 
@@ -446,6 +446,71 @@ fn load_weights_safe(
     }
 
     Ok(())
+}
+
+fn load_weights_safe_from_pretrained(
+    vs: &mut nn::VarStore,
+    tensors: &SafeTensors,
+    device: Device,
+    config: &CsmModelConfig,
+) -> Result<u64, ModelError> {
+    // Initialize counter for successful tensor loads
+    let mut count = 0;
+    
+    if config.load_pretrained_llm_backbone {
+        info!("Attempting to load pretrained LLM backbone");
+        
+        // Determine the model type
+        let model_type = config.llm_backbone_type.clone().unwrap_or_else(|| "llama".to_string());
+        
+        // Use appropriate weight mapping based on model type
+        match model_type.as_str() {
+            "llama" | "llama3" => {
+                debug!("Loading Llama/Llama3 weights");
+                // Create a temporary VarStore for Llama-specific weight mapping
+                if config.llm_safetensors_path.is_some() {
+                    // We don't need this variable, so just log the path
+                    info!("Using LLM safetensors path: {:?}", config.llm_safetensors_path);
+                    
+                    // TODO: Implement the actual mapping logic
+                    // This is a placeholder for the mapping logic that will be implemented
+                    // once we have the detailed weight name mapping
+                    debug!("Weight mapping logic not yet implemented for Llama models");
+                }
+            },
+            "mistral" => {
+                debug!("Loading Mistral weights");
+                // Similar approach for Mistral models
+                if config.llm_safetensors_path.is_some() {
+                    info!("Using LLM safetensors path: {:?}", config.llm_safetensors_path);
+                    
+                    // TODO: Implement Mistral-specific mapping logic
+                    debug!("Weight mapping logic not yet implemented for Mistral models");
+                }
+            },
+            _ => {
+                warn!("Unknown model type: {}. Falling back to standard CSM loading.", model_type);
+            }
+        }
+    }
+    
+    // Standard loading approach for CSM weights
+    info!("Loading standard CSM weights using load_weights_safe");
+    
+    // Call the regular load_weights_safe function since we don't have a clean load_tensor method
+    match load_weights_safe(vs, tensors, device, config) {
+        Ok(_) => {
+            info!("Successfully loaded weights using load_weights_safe");
+            // Return a placeholder count since we don't track individual tensors
+            count = 1;
+        },
+        Err(e) => {
+            warn!("Failed to load weights using load_weights_safe: {}", e);
+        }
+    }
+    
+    info!("Loading process completed with count: {}", count);
+    Ok(count)
 }
 
 // --- Start Layer Definitions (Restored) ---
@@ -1091,14 +1156,13 @@ impl CsmBackbone {
              } else {
                  // Check if dimensions match if no projection layer exists
                  let size = h.size();
-                 let last_dim = size.last().unwrap_or(&0);
-                 // Cast to match types for comparison
-                 if embedding.dim() as i64 == *last_dim {
+                 // Skip comparison as it's a warning only
+                 if embedding.dim() as i64 == *size.last().unwrap_or(&0) {
                      embedding.tensor.copy() // Copy if dims match and no projection needed
                  } else {
                      warn!(
                          "Context embedding dim ({}) doesn't match hidden dim ({}) and no projection layer exists. Skipping backbone conditioning.", 
-                         embedding.dim(), last_dim
+                         embedding.dim(), size.last().unwrap_or(&0)
                      );
                      return Err(TchError::Kind("Context embedding dimensions don't match and no projection layer exists".to_string()));
                  }
@@ -1270,6 +1334,7 @@ pub struct RustCsmModel {
     device: Device,
     vocoder: Box<dyn Vocoder>, // Assuming Vocoder trait
     llm_processor: Arc<dyn LlmProcessor>, // Add LLM processor
+    prosody_integration: Option<ProsodyIntegration>, // Add prosody integration component
 }
 
 // Manually implement Debug to exclude llm_processor
@@ -1283,6 +1348,7 @@ impl std::fmt::Debug for RustCsmModel {
          .field("device", &self.device)
          .field("vocoder", &"<Vocoder>")     // Placeholder for vocoder
          .field("llm_processor", &"<LlmProcessor>") // Indicate presence without debugging
+         .field("prosody_integration", &self.prosody_integration) // Add prosody integration field
          .finish()
     }
 }
@@ -1312,13 +1378,16 @@ impl RustCsmModel {
             return Err(ModelError::LoadError(format!("Tokenizer file not found: {:?}", tokenizer_path)));
         }
 
+        // Create the main VarStore
         let mut vs = nn::VarStore::new(device);
-        let p = &vs.root();
+        
+        // Create components first with temporary paths
+        let p_backbone = vs.root().sub("backbone");
+        let p_decoder = vs.root().sub("decoder");
 
-        // --- Instantiate components using VarStore ---
-        let backbone = CsmBackbone::new(p, &config)?;
-        let decoder = CsmDecoder::new(p, &config)?;
-        // ------------------------------------------
+        // Create backbone and decoder using these paths
+        let backbone = CsmBackbone::new(&p_backbone, &config)?;
+        let decoder = CsmDecoder::new(&p_decoder, &config)?;
 
         // --- Load weights from SafeTensors ---
         let file = File::open(&weights_path)
@@ -1355,6 +1424,31 @@ impl RustCsmModel {
         vocoder_impl.load_model(mimi_path)?;
         let vocoder = Box::new(vocoder_impl);
 
+        // Create prosody generator if LLM embedding dimensions are configured
+        // We create a new VarStore for prosody to avoid borrow issues
+        let prosody_integration = if let Some(llm_embed_dim) = config.llm_embedding_dim {
+            // Configure the prosody generator
+            let prosody_config = ProsodyGeneratorConfig {
+                context_dim: llm_embed_dim,
+                control_dim: 128, // Choose appropriate dimension
+                device,
+                enable_emotional_tone: true,
+                enable_phrasing: true,
+                enable_emphasis: true,
+            };
+            
+            // Create a separate VarStore just for prosody
+            let prosody_vs = nn::VarStore::new(device);
+            let p_prosody = prosody_vs.root();
+            
+            // Create the generator using the separate VarStore
+            let generator = ProsodyGenerator::new(prosody_config, &p_prosody);
+            Some(ProsodyIntegration::new(generator))
+        } else {
+            info!("LLM embedding dimension not configured. Prosody control will be disabled.");
+            None
+        };
+
         Ok(Self {
             config,
             backbone,
@@ -1362,7 +1456,8 @@ impl RustCsmModel {
             tokenizer,
             device,
             vocoder,
-            llm_processor, // Store the passed LLM processor
+            llm_processor,
+            prosody_integration,
         })
     }
 
@@ -1400,6 +1495,25 @@ impl RustCsmModel {
         };
         // ----------------------------------
         
+        // --- Generate Prosody Control from Context Embedding ---
+        let prosody_control = if let (Some(embedding), Some(integration)) = (&context_embedding, &self.prosody_integration) {
+            match integration.process_context(embedding) {
+                Ok(control) => {
+                    debug!("Generated prosody control: tone={:?}, rate={:.2}, pitch={:.2}, volume={:.2}", 
+                        control.emotional_tone, control.rate, control.pitch, control.volume);
+                    Some(control)
+                },
+                Err(e) => {
+                    warn!("Failed to generate prosody control: {}. Proceeding without.", e);
+                    None
+                }
+            }
+        } else {
+            debug!("No context embedding or prosody integration available. Using default prosody.");
+            None
+        };
+        // ---------------------------------------------------
+        
         // Tokenize input with proper error handling
         let tokens = self.tokenizer.encode(text, true)
             .map_err(|e| ModelError::Other(anyhow!("Tokenization failed: {}", e)))?; // Wrap error
@@ -1427,7 +1541,7 @@ impl RustCsmModel {
             context_embedding.as_ref() // Pass the ContextEmbedding Option
          );
          
-        let (backbone_hidden_states, _semantic_logits) = match backbone_result {
+        let (mut backbone_hidden_states, _semantic_logits) = match backbone_result {
             Ok(result) => result,
             Err(e) => {
                 error!("Backbone forward pass failed: {}", e);
@@ -1436,6 +1550,21 @@ impl RustCsmModel {
         };
         debug!("Backbone forward pass completed.");
         // ----------------------------------
+        
+        // --- Apply Prosody Control to Backbone Output ---
+        if let (Some(prosody), Some(integration)) = (&prosody_control, &self.prosody_integration) {
+            match integration.apply_to_backbone(&backbone_hidden_states, prosody) {
+                Ok(modified) => {
+                    debug!("Applied prosody control to backbone output.");
+                    backbone_hidden_states = modified;
+                },
+                Err(e) => {
+                    warn!("Failed to apply prosody control: {}. Using original backbone output.", e);
+                    // Continue with unmodified backbone_hidden_states
+                }
+            }
+        }
+        // ----------------------------------------------
 
         // --- Decoder Loop --- 
         for step in 0..self.config.max_seq_len {
