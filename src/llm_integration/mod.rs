@@ -5,15 +5,18 @@
 
 use anyhow::Result;
 use std::sync::Arc;
+use std::any::Any;
 
 // Modules
 mod context_embeddings;
 mod llm_service;
 mod prompt_templates;
+mod optimization;
 
 // Re-exports
 pub use context_embeddings::{ContextEmbedding, ContextEmbeddingConfig, ContextEmbeddingGenerator, CacheStats};
 pub use prompt_templates::{PromptTemplate, PromptTemplateRegistry, PromptType};
+pub use optimization::{OptimizedLlm, OptimizedInference, TimingStats, ComputationCache, create_optimized_llm, optimized_tensor_op};
 
 /// Unified interface for LLM operations in the CSM system
 pub trait LlmProcessor: Send + Sync {
@@ -25,6 +28,9 @@ pub trait LlmProcessor: Send + Sync {
     
     /// Generate a response based on conversation history
     fn generate_response(&self, context: &crate::context::ConversationHistory) -> Result<String>;
+    
+    /// Convert to Any for downcasting
+    fn as_any(&self) -> &dyn Any;
 }
 
 // Export the trait and necessary concrete types/configs
@@ -37,6 +43,12 @@ pub mod tests;
 /// Factory function to create an appropriate LLM service based on configuration
 pub fn create_llm_service(config: LlmConfig) -> Result<Arc<dyn LlmProcessor>> {
     llm_service::create_service(config)
+}
+
+/// Factory function to create an optimized LLM service based on configuration
+pub fn create_optimized_llm_service(config: LlmConfig) -> Result<Arc<OptimizedLlm>> {
+    let llm = create_llm_service(config)?;
+    Ok(create_optimized_llm(llm))
 }
 
 /// Convert from context::ConversationHistory to our local ConversationHistory
