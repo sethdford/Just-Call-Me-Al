@@ -12,11 +12,17 @@ mod context_embeddings;
 mod llm_service;
 mod prompt_templates;
 mod optimization;
+mod evaluation;
 
 // Re-exports
 pub use context_embeddings::{ContextEmbedding, ContextEmbeddingConfig, ContextEmbeddingGenerator, CacheStats};
 pub use prompt_templates::{PromptTemplate, PromptTemplateRegistry, PromptType};
 pub use optimization::{OptimizedLlm, OptimizedInference, TimingStats, ComputationCache, create_optimized_llm, optimized_tensor_op};
+pub use evaluation::{
+    MetricType, MetricReading, MetricsRegistry, MetricsConfig, MetricsReport,
+    MetricStatistics, InstrumentedLlmProcessor, BenchmarkResults, LlmBenchmark,
+    create_instrumented_llm
+};
 
 /// Unified interface for LLM operations in the CSM system
 pub trait LlmProcessor: Send + Sync {
@@ -49,6 +55,12 @@ pub fn create_llm_service(config: LlmConfig) -> Result<Arc<dyn LlmProcessor>> {
 pub fn create_optimized_llm_service(config: LlmConfig) -> Result<Arc<OptimizedLlm>> {
     let llm = create_llm_service(config)?;
     Ok(create_optimized_llm(llm))
+}
+
+/// Factory function to create an instrumented LLM service with monitoring
+pub fn create_monitored_llm_service(config: LlmConfig, metrics_config: Option<MetricsConfig>) -> Result<Arc<InstrumentedLlmProcessor>> {
+    let llm = create_llm_service(config)?;
+    Ok(create_instrumented_llm(llm, metrics_config))
 }
 
 /// Convert from context::ConversationHistory to our local ConversationHistory
