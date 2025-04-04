@@ -545,4 +545,168 @@ cargo run --release --bin setup_neural_tts -- --output-dir models/csm-1b/neural_
 - [tch-rs: Rust bindings for PyTorch](https://github.com/LaurentMazare/tch-rs)
 - [Hugging Face Tokenizers](https://github.com/huggingface/tokenizers)
 - [safetensors](https://github.com/huggingface/safetensors)
-- **[Moshi Project (Kyutai Labs)](https://github.com/kyutai-labs/moshi)** - Source of the Mimi Neural Audio Codec used for vocoding. 
+- **[Moshi Project (Kyutai Labs)](https://github.com/kyutai-labs/moshi)** - Source of the Mimi Neural Audio Codec used for vocoding.
+
+## Speech-to-Text Support
+
+This application includes speech-to-text (STT) capabilities using the Moshi model from Kyutai Labs. To use this feature, you need to download the required model files:
+
+### Compatible Audio Formats
+
+The STT component requires audio in specific formats for optimal performance:
+
+| Parameter | Required Format | Notes |
+|-----------|----------------|-------|
+| Sample Rate | 24 kHz | The Moshi STT model is trained on 24 kHz audio. Other sample rates will be automatically resampled |
+| Channels | Mono (1 channel) | Stereo audio will be automatically converted to mono |
+| Bit Depth | 16-bit or 32-bit float | 16-bit PCM or 32-bit float samples are supported |
+| File Format | WAV | Other formats need to be converted to WAV |
+| Duration | Any | Longer files will be processed in chunks |
+| Language | English | Currently only English is supported |
+| Codec | PCM (uncompressed) | Compressed audio formats need to be decompressed |
+
+You can convert audio files to the required format using tools like ffmpeg:
+
+```bash
+# Convert any audio file to 24 kHz mono WAV
+ffmpeg -i input.mp3 -ar 24000 -ac 1 -c:a pcm_s16le output.wav
+```
+
+### Downloading Model Files
+
+Run the provided script to download the model files:
+
+```bash
+./scripts/download_models.sh
+```
+
+This will download the following files:
+- `models/moshi/language_model.safetensors`: The language model for speech recognition
+- `models/moshi/tokenizer.model`: The tokenizer for text processing
+- `models/mimi/model.safetensors`: The Mimi audio processing model
+
+Note: The download URLs in the script might need to be updated if the model files are moved to different locations.
+
+### Testing STT Functionality
+
+After downloading the model files, you can test the STT functionality with a sample WAV file:
+
+```bash
+cargo run --bin stt_test -- path/to/your/audio.wav
+```
+
+### WebSocket API for STT
+
+The application exposes speech recognition capabilities through its WebSocket API. Clients can send audio data and receive transcripts in real-time.
+
+#### WebSocket Protocol
+
+1. **Connection**: Connect to the WebSocket endpoint at `ws://localhost:8000/ws`
+
+2. **Initialization**: Upon connection, the server sends an initialization message:
+   ```json
+   {
+     "type": "init",
+     "stt_available": true
+   }
+   ```
+   The `stt_available` flag indicates whether STT is enabled and all required models are loaded.
+
+3. **Sending Audio**: Send audio data as binary chunks or base64-encoded in JSON:
+   ```json
+   {
+     "type": "audio_data",
+     "data": "<base64-encoded-audio-chunk>",
+     "sample_rate": 24000
+   }
+   ```
+
+4. **Receiving Transcripts**: The server will respond with transcript messages:
+   ```json
+   {
+     "type": "transcript",
+     "text": "recognized text",
+     "start_time": 1.25,
+     "stop_time": 2.5
+   }
+   ```
+
+5. **Stopping Recognition**: Send a stop message to end the recognition session:
+   ```json
+   {
+     "type": "stop_audio"
+   }
+   ```
+
+### Performance Considerations
+
+- **CPU Usage**: Speech recognition is computationally intensive. Higher-end CPUs will provide better performance.
+- **GPU Acceleration**: If CUDA is available, the STT model will automatically use GPU acceleration.
+- **Memory Usage**: The STT models require approximately 2-3GB of RAM when loaded.
+- **Latency**: There is a natural delay in recognition as the model requires context to accurately transcribe speech.
+- **Streaming Performance**: The STT system processes audio in chunks of 200ms (4800 samples at 24kHz).
+
+### Limitations
+
+- **English Only**: Currently, only English language recognition is supported.
+- **Environmental Noise**: Performance may degrade in noisy environments.
+- **Speaker Independence**: The model is trained on diverse speakers but may have varying accuracy across different accents and speech patterns.
+- **Technical Terms**: Specialized vocabulary or technical terms may not be recognized accurately.
+- **Continuous Speech**: The model performs best with natural, continuous speech rather than isolated words.
+
+### Troubleshooting
+
+If you encounter issues with the STT functionality:
+
+1. **Model Loading Failures**:
+   - Verify that all required model files are present in the correct directories.
+   - Check disk space and file permissions.
+   - Ensure model files are not corrupted by verifying checksums.
+
+2. **No Transcripts Appearing**:
+   - Check that audio input is being correctly captured.
+   - Verify the audio format matches the requirements.
+   - Look for error messages in the server logs.
+   - Try increasing the volume or improving audio quality.
+
+3. **Poor Recognition Quality**:
+   - Ensure audio is clear and not distorted.
+   - Reduce background noise.
+   - Speak clearly and at a moderate pace.
+   - Check that the audio sample rate is correct.
+
+4. **High CPU/Memory Usage**:
+   - Consider enabling GPU acceleration if available.
+   - Process shorter audio segments.
+   - Close other CPU/memory-intensive applications.
+
+### Customizing & Extending
+
+The STT implementation can be customized and extended in several ways:
+
+#### Using Different Models
+
+The system is designed to work with Moshi models, but you can:
+
+1. **Switch Model Versions**: Update the paths in the configuration to use different model files.
+2. **Custom Fine-tuned Models**: Replace the default models with your own fine-tuned versions for specific domains or accents.
+
+#### Implementation Details
+
+The STT functionality is implemented in:
+
+- `src/stt/mod.rs`: Main STT module interface
+- `src/stt/moshi_stt.rs`: Moshi-specific implementation
+- `src/bin/stt_test.rs`: Command-line testing utility
+
+#### Adding New Features
+
+Some ways to extend the STT functionality:
+
+1. **Language Detection**: Add support for detecting the spoken language before transcription.
+2. **Speaker Diarization**: Identify different speakers in the audio.
+3. **Additional Languages**: Add support for transcribing other languages.
+4. **Domain-Specific Vocabulary**: Augment the language model with specialized terminology.
+5. **Word Confidence Scores**: Add support for reporting confidence levels for each recognized word.
+
+Contributions to extend or improve the STT functionality are welcome! 

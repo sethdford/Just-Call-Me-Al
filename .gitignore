@@ -101,4 +101,12 @@ node_modules/
 # OS specific
 # Task files
 tasks.json
-tasks/ 
+tasks/
+
+# Model files (large binary files)
+models/moshi/language_model.safetensors
+models/moshi/tokenizer.model
+models/mimi/model.safetensors
+
+# Test data
+test_data/audio/*.wav 

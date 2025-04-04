@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 // Only declare modules that have corresponding files.
 pub mod config;
 pub mod csm;
-pub mod tensor; // Assuming tensor.rs exists for SafeTensor
+pub mod moshi_speech_model;
 
 // Remove declarations for non-existent files:
 // pub mod attention;
@@ -26,6 +26,7 @@ pub use config::CsmModelConfig; // Example
 pub use csm::CSMImpl;      // Keep CSMImpl as the main export
 // Remove the example SafeTensor export if it's not defined
 // pub use tensor::SafeTensor; // Example
+pub use moshi_speech_model::MoshiSpeechModel;
 
 // --- Error Type ---
 #[derive(Debug, thiserror::Error)]

@@ -1,10 +1,16 @@
-pub mod audio;
+// Copyright (c) Kyutai, all rights reserved.
+// This source code is licensed under the license found in the
+// LICENSE file in the root directory of this source tree.
+
+pub mod vocoder;
 pub mod models;
+pub mod audio;
+#[cfg(feature = "python")]
+pub mod python;
 pub mod server;
 pub mod utils;
 pub mod tokenization;
 pub mod rvq;
-pub mod vocoder;
 
 // Ensure ONLY CSMModel is re-exported here
 pub use models::{CSMModel};

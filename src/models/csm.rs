@@ -1,7 +1,7 @@
 use std::path::Path;
 use tch::{Device, Tensor, Kind, TchError, nn};
 use crate::models::{CSMModel, ModelError};
-use crate::models::config::{CsmModelConfig, SynthesizerParams};
+use crate::models::config::CsmModelConfig;
 use tokenizers::Tokenizer;
 use async_trait::async_trait;
 use safetensors::SafeTensors;
@@ -10,12 +10,12 @@ use std::sync::Arc;
 use tch::nn::Module;
 use std::collections::HashMap;
 use tokio::sync::mpsc;
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 use std::fs::File;
 use memmap2::MmapOptions;
 use tokio::sync::Mutex as TokioMutex;
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use crate::vocoder::Vocoder; // Import the Vocoder trait if needed for decode
 use crate::vocoder::MimiVocoder; // Add MimiVocoder import
 
@@ -785,11 +785,10 @@ impl TransformerBlock {
         cache: &mut AttentionCache,
         conditioning_embedding: Option<&Tensor>
     ) -> Result<Tensor, TchError> {
+        // Keep input shape log at info for now
         info!("  TransformerBlock input shape: {:?}", xs.size());
 
         let residual = xs;
-        // Remove unused variable
-        // let normed_xs_attn = xs;
 
         let (gamma_attn, beta_attn) = match conditioning_embedding {
             Some(cond_emb) => {
@@ -802,11 +801,12 @@ impl TransformerBlock {
         
         let normed_xs_attn = self.attn_norm.forward(xs, gamma_attn.as_ref(), beta_attn.as_ref())?;
 
-        info!("    Normed for Attn shape: {:?}", normed_xs_attn.size());
+        // Change intermediate shape logs to debug
+        debug!("    Normed for Attn shape: {:?}", normed_xs_attn.size());
         let attn_output = self.attn.forward(&normed_xs_attn, start_pos, mask, cache)?;
-        info!("    Attn output shape: {:?}", attn_output.size());
+        debug!("    Attn output shape: {:?}", attn_output.size());
         let h = residual.f_add(&attn_output)?;
-        info!("    After Attn Add shape: {:?}", h.size());
+        debug!("    After Attn Add shape: {:?}", h.size());
 
         let residual_ffn = &h;
         
@@ -821,11 +821,13 @@ impl TransformerBlock {
 
         let normed_h_ffn = self.ffn_norm.forward(&h, ffn_gamma.as_ref(), ffn_beta.as_ref())?; 
 
-        info!("    Normed for FFN shape: {:?}", normed_h_ffn.size());
+        // Change intermediate shape logs to debug
+        debug!("    Normed for FFN shape: {:?}", normed_h_ffn.size());
         let ffn_output = self.ffn.forward(&normed_h_ffn)?;
-        info!("    FFN output shape: {:?}", ffn_output.size());
+        debug!("    FFN output shape: {:?}", ffn_output.size());
         let final_output = residual_ffn.f_add(&ffn_output)?;
-        info!("  TransformerBlock output shape: {:?}", final_output.size());
+        // Keep output shape log at info for now
+        info!("  TransformerBlock output shape: {:?}", final_output.size()); 
         Ok(final_output)
     }
 }
@@ -884,7 +886,8 @@ impl LlamaTransformer {
         cache: &mut TransformerCache,
         conditioning_embedding: Option<&Tensor>
     ) -> Result<Tensor, TchError> {
-        info!("Shape entering Llama::forward: {:?}", xs.size());
+        // Change top-level forward entry to debug
+        debug!("Shape entering Llama::forward: {:?}", xs.size()); 
         let mut current_xs = xs.copy();
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
              let layer_cache = cache.layer_caches.get_mut(layer_idx)
@@ -892,17 +895,27 @@ impl LlamaTransformer {
              current_xs = layer.forward(&current_xs, start_pos, mask, layer_cache, conditioning_embedding)?;
         }
 
+        // Determine gamma and beta for the final norm
         let (gamma_final, beta_final) = match conditioning_embedding {
             Some(cond_emb) => {
+                // Project the provided conditioning embedding
                 let gamma = self.final_gamma_proj.forward(cond_emb);
                 let beta = self.final_beta_proj.forward(cond_emb);
-                (gamma.unsqueeze(1), beta.unsqueeze(1))
+                // Unsqueeze to match target shape [B, 1, D]
+                (gamma.unsqueeze(1), beta.unsqueeze(1)) 
             }
             None => {
-                return Err(TchError::Kind("Conditioning embedding required for final norm but not provided".into()));
+                // Keep this info log as it's important
+                info!("No conditioning embedding provided, using default final norm values."); 
+                let (_b_sz, _seq_len, embed_dim) = current_xs.size3()?; // Get embed_dim from current tensor
+                let default_gamma = Tensor::ones(&[1, 1, embed_dim], (Kind::Float, xs.device())); // Shape [1, 1, D]
+                let default_beta = Tensor::zeros(&[1, 1, embed_dim], (Kind::Float, xs.device())); // Shape [1, 1, D]
+                // These will broadcast correctly to [B, S, D]
+                (default_gamma, default_beta)
             }
         };
         
+        // Apply the final norm using either projected or default gamma/beta
         self.norm.forward(&current_xs, Some(&gamma_final), Some(&beta_final))
     }
 }
@@ -1182,7 +1195,8 @@ impl RustCsmModel {
 
         // Create and initialize the vocoder
         let mut vocoder_impl = MimiVocoder::new(24000, device)?;
-        vocoder_impl.load_model(model_dir.join("mimi/model.safetensors"))?;
+        let mimi_path = model_dir.parent().unwrap_or(model_dir).join("mimi/model.safetensors");
+        vocoder_impl.load_model(mimi_path)?;
         let vocoder = Box::new(vocoder_impl);
 
         Ok(Self {
