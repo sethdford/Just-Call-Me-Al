@@ -384,7 +384,12 @@ fn tensor_view_to_tensor(view: &TensorView<'_>, device: Device) -> Result<Tensor
     Ok(tensor.to_device(device))
 }
 
-fn load_weights_safe(vs: &mut nn::VarStore, tensors: &SafeTensors, device: Device) -> Result<(), TchError> {
+fn load_weights_safe(
+    vs: &mut nn::VarStore, 
+    tensors: &SafeTensors, 
+    device: Device, 
+    config: &CsmModelConfig
+) -> Result<(), TchError> {
     info!("Loading weights safely from SafeTensors...");
     let mut loaded_tensors_map: HashMap<String, Tensor> = HashMap::new();
 
@@ -410,19 +415,25 @@ fn load_weights_safe(vs: &mut nn::VarStore, tensors: &SafeTensors, device: Devic
     info!("Attempting to copy weights into {} VarStore variables...", variables_in_vs.len());
 
     for (var_path, mut var) in variables_in_vs {
-        let safetensors_key = var_path.replace('/', ".");
+        let relative_path = &var_path;
+        let safetensors_key = map_varstore_path_to_safetensor_key(
+            relative_path, 
+            config,
+            config.pretrained_llm_backbone_type.as_deref()
+        );
+        
         if let Some(loaded_tensor) = loaded_tensors_map.get(&safetensors_key) {
             if var.size() == loaded_tensor.size() {
                 tch::no_grad(|| { var.copy_(loaded_tensor); });
                 loaded_count += 1;
             } else {
-                warn!("Shape mismatch for '{}': VarStore={:?}, SafeTensor={:?}. Skipping.",
-                       safetensors_key, var.size(), loaded_tensor.size());
+                warn!("Shape mismatch for '{}' (Mapped from '{}'): VarStore={:?}, SafeTensor={:?}. Skipping.",
+                       safetensors_key, relative_path, var.size(), loaded_tensor.size());
                 skipped_count += 1;
             }
         } else {
-            warn!("Variable '{}' defined in VarStore, but no corresponding key '{}' found in SafeTensors file.",
-                   var_path, safetensors_key);
+            warn!("Variable '{}' defined in VarStore structure, but no corresponding key '{}' found in SafeTensors file.",
+                   relative_path, safetensors_key);
             missing_count += 1;
         }
     }
@@ -431,7 +442,7 @@ fn load_weights_safe(vs: &mut nn::VarStore, tensors: &SafeTensors, device: Devic
             loaded_count, skipped_count, missing_count);
 
     if loaded_count == 0 && !loaded_tensors_map.is_empty() {
-        return Err(TchError::FileFormat("Failed to load any weights.".to_string()));
+        return Err(TchError::Kind("Failed to load any weights. Check naming conventions and paths.".to_string()));
     }
 
     Ok(())
@@ -833,42 +844,140 @@ struct LlamaTransformer {
     final_beta_proj: nn::Linear,
 }
 
+// --- Define Helper Function OUTSIDE impl block --- 
+// Now takes config explicitly
+fn map_varstore_path_to_safetensor_key(
+    vs_path: &str,
+    config: &CsmModelConfig,
+    _model_type: Option<&str> // Placeholder
+) -> String {
+    // Access config fields if needed (e.g., config.pretrained_llm_backbone_type)
+    vs_path
+        .replace("/", ".")
+        .replace("attn.q_proj.ws", "attention.wq.weight") 
+        .replace("attn.k_proj.ws", "attention.wk.weight")
+        .replace("attn.v_proj.ws", "attention.wv.weight")
+        .replace("attn.o_proj.ws", "attention.wo.weight")
+        .replace("ffn.w1.ws", "feed_forward.w1.weight") // Or mlp.gate_proj?
+        .replace("ffn.w2.ws", "feed_forward.w2.weight") // Or mlp.down_proj?
+        .replace("ffn.w3.ws", "feed_forward.w3.weight") // Or mlp.up_proj?
+        .replace("attn_norm.ws", "input_layernorm.weight")
+        .replace("ffn_norm.ws", "post_attention_layernorm.weight")
+        .replace("norm.ws", "norm.weight")
+        .replace(".bs", ".bias")
+        .replace(".ws", ".weight")
+}
+// --- End Helper Function Definition ---
+
 impl LlamaTransformer {
     fn new(vs: &nn::Path, config: &CsmModelConfig, is_backbone: bool) -> Result<Self, TchError> {
-        let (num_layers, embed_dim, head_dim, norm_eps, rope_base) = if is_backbone {
-            (
-                config.backbone_num_layers,
-                config.backbone_embed_dim,
-                config.backbone_embed_dim / config.backbone_num_heads,
-                config.backbone_norm_eps,
-                config.backbone_rope_base
-            )
+        // Helper function defined outside
+        
+        let device = vs.device();
+        let (num_layers, embed_dim, head_dim, norm_eps, rope_base) = if is_backbone { 
+            (config.backbone_num_layers, config.backbone_embed_dim, config.backbone_embed_dim / config.backbone_num_heads, config.backbone_norm_eps, config.backbone_rope_base)
         } else {
-            (
-                config.decoder_num_layers,
-                config.decoder_embed_dim,
-                config.decoder_embed_dim / config.decoder_num_heads,
-                config.decoder_norm_eps,
-                config.decoder_rope_base
-            )
+            (config.decoder_num_layers, config.decoder_embed_dim, config.decoder_embed_dim / config.decoder_num_heads, config.decoder_norm_eps, config.decoder_rope_base)
         };
+        let rotary_emb = RotaryEmbedding::new(head_dim, config.max_seq_len, rope_base, device)?;
 
-        let rotary_emb = RotaryEmbedding::new(head_dim, config.max_seq_len, rope_base, vs.device())?;
+        if is_backbone && config.load_pretrained_llm_backbone {
+            info!("Loading pre-trained LLM backbone weights.");
+            let weights_path = config.pretrained_llm_backbone_path.as_ref()
+                .ok_or_else(|| TchError::Kind("Pre-trained LLM backbone path not provided in config.".to_string()))?;
 
-        let mut layers = Vec::with_capacity(num_layers as usize);
-        let layers_vs = vs / "layers";
-        for i in 0..num_layers {
-            let layer = TransformerBlock::new(layers_vs.clone() / i, config, rotary_emb.clone(), is_backbone)?;
-            layers.push(layer);
+            // --- Load Tensors into Map --- 
+            let buffer = std::fs::read(weights_path).map_err(|e| TchError::Kind(format!("Failed to read weights file: {}", e)))?;
+            let st_tensors = SafeTensors::deserialize(&buffer).map_err(|e| TchError::Kind(format!("Failed to deserialize safetensors: {}", e)))?;
+            let mut loaded_tensors_map: HashMap<String, Tensor> = HashMap::new();
+            // ... [loading loop into loaded_tensors_map] ...
+             for name in st_tensors.names() {
+                match st_tensors.tensor(name) {
+                    Ok(tensor_view) => {
+                        match tensor_view_to_tensor(&tensor_view, device) {
+                            Ok(tensor) => { loaded_tensors_map.insert(name.to_string(), tensor); },
+                            Err(e) => warn!("Failed to convert tensor view '{}': {}", name, e),
+                        }
+                    }
+                    Err(e) => warn!("Failed to get tensor view '{}': {}", name, e),
+                }
+            }
+            info!("Deserialized {} tensors from {}", loaded_tensors_map.len(), weights_path.display());
+
+            // --- Build Structure in Temp VarStore --- 
+            let temp_vs_path = vs / "pretrained_loader";
+            let mut temp_vs = nn::VarStore::new(device);
+            let temp_root = temp_vs.root();
+            let layers_vs_temp = temp_root.clone() / "layers"; // Fix 2: Clone temp_root
+            for i in 0..num_layers {
+                let _layer_structure = TransformerBlock::new(layers_vs_temp.clone() / i, config, rotary_emb.clone(), is_backbone)?;
+            }
+            let _norm_structure = RmsNorm::new(temp_root.clone() / "norm", embed_dim, norm_eps)?; // Fix 2: Clone temp_root
+
+            // --- Copy Weights into Temp VarStore --- 
+            let mut loaded_count = 0;
+            let mut skipped_count = 0;
+            let mut missing_count = 0;
+            let variables_in_vs = temp_vs.variables(); // Define variables_in_vs here
+            info!("Attempting to copy weights into {} VarStore variables...", variables_in_vs.len());
+            for (var_path, mut var) in variables_in_vs {
+                let relative_path = &var_path;
+                let safetensors_key = map_varstore_path_to_safetensor_key(relative_path, config, config.pretrained_llm_backbone_type.as_deref());
+                if let Some(loaded_tensor) = loaded_tensors_map.get(&safetensors_key) {
+                    if var.size() == loaded_tensor.size() {
+                        tch::no_grad(|| { var.copy_(loaded_tensor); });
+                        loaded_count += 1;
+                    } else {
+                        warn!("Shape mismatch for '{}' (...): VarStore={:?}, SafeTensor={:?}. Skipping.", safetensors_key, var.size(), loaded_tensor.size());
+                        skipped_count += 1;
+                    }
+                } else {
+                    warn!("Variable '{}' (...), but no key '{}' found.", relative_path, safetensors_key);
+                    missing_count += 1;
+                }
+            }
+            info!("Weight loading finished. Copied: {}, Skipped: {}, Missing: {}", loaded_count, skipped_count, missing_count);
+            if loaded_count == 0 && !loaded_tensors_map.is_empty() {
+                 return Err(TchError::Kind("Failed to load any weights...".to_string()));
+             }
+
+            // --- Build Final Layers from Populated Temp VarStore --- 
+            let mut layers_final = Vec::with_capacity(num_layers as usize);
+            let layers_vs_loaded = temp_root.clone() / "layers"; // Fix 2: Clone temp_root
+            for i in 0..num_layers {
+                let layer = TransformerBlock::new(layers_vs_loaded.clone() / i, config, rotary_emb.clone(), is_backbone)?;
+                layers_final.push(layer);
+            }
+            let norm_final = RmsNorm::new(temp_root.clone() / "norm", embed_dim, norm_eps)?; // Fix 2: Clone temp_root
+            
+            // Define conditioning projections using original 'vs'
+            let conditioning_dim = embed_dim;
+            let proj_config = Default::default();
+            let final_gamma_proj = nn::linear(vs.clone() / "final_gamma_proj", conditioning_dim, embed_dim, proj_config); // Define final_gamma_proj
+            let final_beta_proj = nn::linear(vs.clone() / "final_beta_proj", conditioning_dim, embed_dim, proj_config); // Define final_beta_proj
+            
+            // Return using defined variables
+            Ok(Self { layers: layers_final, norm: norm_final, final_gamma_proj, final_beta_proj })
+
+        } else {
+            // --- Original Logic: Initialize new weights using 'vs' --- 
+            info!("Initializing new weights for {} transformer.", if is_backbone { "backbone" } else { "decoder" });
+            let mut layers = Vec::with_capacity(num_layers as usize); // Define layers
+            let layers_vs = vs / "layers";
+            for i in 0..num_layers {
+                let layer = TransformerBlock::new(layers_vs.clone() / i, config, rotary_emb.clone(), is_backbone)?;
+                layers.push(layer);
+            }
+            let norm = RmsNorm::new(vs / "norm", embed_dim, norm_eps)?; // Define norm
+
+            let conditioning_dim = embed_dim;
+            let proj_config = Default::default();
+            let final_gamma_proj = nn::linear(vs.clone() / "final_gamma_proj", conditioning_dim, embed_dim, proj_config); // Define final_gamma_proj
+            let final_beta_proj = nn::linear(vs.clone() / "final_beta_proj", conditioning_dim, embed_dim, proj_config); // Define final_beta_proj
+
+            // Return using defined variables
+            Ok(Self { layers, norm, final_gamma_proj, final_beta_proj })
         }
-        let norm = RmsNorm::new(vs / "norm", embed_dim, norm_eps)?;
-
-        let conditioning_dim = embed_dim;
-        let proj_config = Default::default();
-        let final_gamma_proj = nn::linear(vs.clone() / "final_gamma_proj", conditioning_dim, embed_dim, proj_config);
-        let final_beta_proj = nn::linear(vs.clone() / "final_beta_proj", conditioning_dim, embed_dim, proj_config);
-
-        Ok(Self { layers, norm, final_gamma_proj, final_beta_proj })
     }
 
     fn forward(
@@ -1221,7 +1330,7 @@ impl RustCsmModel {
         let tensors = SafeTensors::deserialize(&mmap)
              .map_err(|e| ModelError::LoadError(format!("Failed to deserialize safetensors from {:?}: {}", weights_path, e)))?;
 
-        match load_weights_safe(&mut vs, &tensors, device) {
+        match load_weights_safe(&mut vs, &tensors, device, &config) {
              Ok(_) => info!("Successfully attempted weights load."),
              Err(e) => warn!("Weight loading error: {}", e),
         };

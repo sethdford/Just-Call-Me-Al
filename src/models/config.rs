@@ -2,6 +2,7 @@ use tch::Device;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::path::PathBuf;
 use crate::models::ModelError;
 use serde::Deserialize;
 
@@ -46,6 +47,17 @@ pub struct CsmModelConfig {
     pub max_seq_len: i64,       // 2048 (Max sequence length for transformers)
     pub attn_dropout: f64,      // 0.0
     // pub scale_factor: f64,   // 32.0 (Seems specific to torchtune impl, maybe not needed directly)
+
+    // --- NEW: Pre-trained LLM Backbone Loading Params ---
+    #[serde(default)] // Defaults to false
+    pub load_pretrained_llm_backbone: bool,
+
+    #[serde(default)]
+    pub pretrained_llm_backbone_path: Option<PathBuf>,
+
+    #[serde(default)] // e.g., "llama", "mistral" - for potential weight name mapping
+    pub pretrained_llm_backbone_type: Option<String>,
+    // --- End NEW Params ---
 
     // LLM Integration Params
     #[serde(default)] // Use default if not present in config.json
