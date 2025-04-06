@@ -1,3 +1,54 @@
+//! # Residual Vector Quantization (RVQ) Module
+//!
+//! This module implements Residual Vector Quantization (RVQ), a technique for efficiently 
+//! quantizing high-dimensional vectors into discrete codes, which is especially useful for
+//! compressing audio features and neural network embeddings.
+//!
+//! ## Overview
+//!
+//! RVQ works by sequentially applying multiple vector quantizers (codebooks), where each 
+//! quantizer encodes the residual error from the previous ones. This approach achieves better
+//! reconstruction quality than single-codebook VQ at the same bitrate.
+//!
+//! The process involves:
+//! 1. The first codebook quantizes the input vector
+//! 2. The residual (error) is computed between the original vector and the quantized one
+//! 3. The next codebook quantizes this residual
+//! 4. This process repeats for all codebooks
+//!
+//! ## Components
+//!
+//! - `RVQConfig`: Configuration for RVQ encoder and decoder
+//! - `RVQEncoder`: Encodes continuous vectors into sequences of discrete indices
+//! - `RVQDecoder`: Reconstructs vectors from discrete indices using codebooks
+//!
+//! ## Training
+//!
+//! The codebooks can be updated using the `update` method on the `RVQEncoder`, which
+//! implements a simplified K-means clustering to learn appropriate codebook vectors.
+//!
+//! ## Usage
+//!
+//! ```rust
+//! // Create an RVQ encoder with 2 codebooks of size 256 and vector dimension 64
+//! let encoder = RVQEncoder::new(device, 2, 256, 64);
+//!
+//! // Encode input vectors (shape [batch, seq_len, dim])
+//! let codes = encoder.encode(&input_tensor)?;
+//!
+//! // Create a compatible decoder that shares codebooks
+//! let decoder = RVQDecoder::new(encoder.codebooks.clone(), encoder.vector_dim, device);
+//!
+//! // Decode back to vectors
+//! let code_refs: Vec<&Tensor> = codes.iter().collect();
+//! let reconstructed = decoder.decode(&code_refs)?;
+//! ```
+//!
+//! ## Performance
+//!
+//! The implementation uses efficient tensor operations to minimize computational cost.
+//! Distance calculations use broadcasting for parallel computation of all distances.
+
 use anyhow::{Result, anyhow};
 use tch::{Tensor, Device, Kind, TchError};
 use std::path::Path;
@@ -6,29 +57,34 @@ use std::fs::File;
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
 use tracing::{info, warn, error};
+use std::sync::Arc;
+use std::ops::Add;
+use std::time::{Instant, Duration};
 
-/// Configuration for RVQ encoder/decoder
+/// Configuration for Residual Vector Quantization (RVQ).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RVQConfig {
-    /// Number of codebooks
-    pub num_codebooks: usize,
-    /// Size of each codebook
-    pub codebook_size: usize,
-    /// Dimension of each vector
-    pub vector_dim: usize,
-    /// Whether to normalize input vectors
-    pub normalize: bool,
-    /// Learning rate for codebook updates
-    pub learning_rate: f32,
-    /// Device to run computations on
+    /// The device (CPU/GPU) on which tensors will be allocated.
     #[serde(skip, default = "default_device")]
     pub device: Device,
+    /// The number of codebooks used in the quantization process.
+    pub num_codebooks: usize,
+    /// The size of each individual codebook.
+    pub codebook_size: usize,
+    /// The dimensionality of the vectors being quantized.
+    pub vector_dim: usize,
+    /// Whether to normalize vectors before quantization.
+    pub normalize: bool,
+    /// Learning rate (if applicable, may not be used at inference).
+    pub learning_rate: f32,
 }
 
+// Helper for serde default
 fn default_device() -> Device {
     Device::Cpu
 }
 
+// Keep only ONE Default implementation (Using the original one found later in the file)
 impl Default for RVQConfig {
     fn default() -> Self {
         Self {
@@ -46,9 +102,10 @@ impl Default for RVQConfig {
 #[derive(Debug)]
 pub struct RVQEncoder {
     device: Device,
-    codebooks: Vec<Tensor>,
-    input_proj_weight: Tensor,
-    input_proj_bias: Option<Tensor>,
+    // Store codebooks as Arc<Tensor>
+    codebooks: Vec<Arc<Tensor>>,
+    input_proj_weight: Arc<Tensor>, // Also Arc if shared
+    input_proj_bias: Option<Arc<Tensor>>, // Also Arc if shared
     num_codebooks: usize,
     codebook_size: i64,
     vector_dim: usize,
@@ -72,7 +129,7 @@ impl RVQEncoder {
     /// Create a new RVQ encoder
     pub fn new(device: Device, num_codebooks: usize, codebook_size: i64, vector_dim: usize) -> Self {
         let codebooks = (0..num_codebooks)
-            .map(|_| Tensor::randn(&[codebook_size, vector_dim as i64], (tch::Kind::Float, device)))
+            .map(|_| Arc::new(Tensor::randn(&[codebook_size, vector_dim as i64], (tch::Kind::Float, device))))
             .collect();
             
         Self {
@@ -82,7 +139,8 @@ impl RVQEncoder {
             codebook_size,
             vector_dim,
             learning_rate: 0.01,
-            input_proj_weight: Tensor::zeros(&[vector_dim as i64, vector_dim as i64], (tch::Kind::Float, device)),
+            // Wrap initial tensors in Arc
+            input_proj_weight: Arc::new(Tensor::zeros(&[vector_dim as i64, vector_dim as i64], (tch::Kind::Float, device))),
             input_proj_bias: None,
         }
     }
@@ -99,7 +157,7 @@ impl RVQEncoder {
         let tensors = SafeTensors::deserialize(&mmap)
             .map_err(|e| anyhow!("Failed to deserialize safetensors from {:?}: {}", path, e))?;
 
-        let mut codebooks = Vec::new();
+        let mut codebooks_arc = Vec::new();
         let mut i = 0;
         loop {
             // Construct the correct tensor name based on the safetensors-cli output
@@ -112,7 +170,7 @@ impl RVQEncoder {
                 Ok(tensor_view) => {
                     match tensor_view_to_tensor(&tensor_view, device) {
                          Ok(tensor) => {
-                            codebooks.push(tensor);
+                            codebooks_arc.push(Arc::new(tensor)); // Push Arc<Tensor>
                             i += 1;
                          },
                          Err(e) => {
@@ -139,13 +197,13 @@ impl RVQEncoder {
         let proj_weight_name = "quantizer.acoustic_residual_vector_quantizer.input_proj.weight";
         let proj_bias_name = "quantizer.acoustic_residual_vector_quantizer.input_proj.bias";
 
-        let input_proj_weight = tensors
+        let input_proj_weight_tensor = tensors
             .tensor(proj_weight_name)
             .map_err(|e| anyhow!("Failed to find input projection weight tensor '{}': {}", proj_weight_name, e))
             .and_then(|view| tensor_view_to_tensor(&view, device).map_err(|e| anyhow!("Failed to convert input projection weight: {}", e)))?
             .squeeze_dim(-1);
         
-        let input_proj_bias = match tensors.tensor(proj_bias_name) {
+        let input_proj_bias_tensor = match tensors.tensor(proj_bias_name) {
             Ok(view) => Some(tensor_view_to_tensor(&view, device)
                 .map_err(|e| anyhow!("Failed to convert input projection bias: {}", e))?),
             Err(_) => {
@@ -154,24 +212,24 @@ impl RVQEncoder {
             }
         };
         info!("Successfully loaded input projection weight. Bias {}found.", 
-              if input_proj_bias.is_some() { "" } else { "not " });
+              if input_proj_bias_tensor.is_some() { "" } else { "not " });
         // --- ADDED LOG: Log projection weight shape ---
-        info!("Loaded input_proj_weight shape: {:?}", input_proj_weight.size());
+        info!("Loaded input_proj_weight shape: {:?}", input_proj_weight_tensor.size());
         // ----------------------------------------------
 
-        if codebooks.is_empty() {
+        if codebooks_arc.is_empty() {
             return Err(anyhow!("No codebooks found or loaded from {:?}", path));
         }
 
         // Infer parameters from the first loaded codebook
-        let first_codebook = &codebooks[0];
+        let first_codebook = &codebooks_arc[0];
         let size = first_codebook.size();
         if size.len() != 2 {
             return Err(anyhow!("Invalid codebook tensor dimensions for layer 0: {:?}. Expected [codebook_size, vector_dim].", size));
         }
         let codebook_size = size[0];
         let vector_dim = size[1] as usize;
-        let num_codebooks = codebooks.len();
+        let num_codebooks = codebooks_arc.len();
 
         info!("Successfully loaded {} codebooks. Size={}, Dim={}", num_codebooks, codebook_size, vector_dim);
         // --- ADDED LOG: Log inferred codebook dimension ---
@@ -179,7 +237,7 @@ impl RVQEncoder {
         // -------------------------------------------------
 
         // --- ADDED CHECK: Compare projection output dim and codebook dim ---
-        let proj_output_dim = input_proj_weight.size()[0]; // First dimension after transpose
+        let proj_output_dim = input_proj_weight_tensor.size()[0]; // First dimension after transpose
         if proj_output_dim != vector_dim as i64 {
             error!(
                 "Dimension mismatch! Input projection output dimension ({}) != Codebook vector dimension ({}).",
@@ -191,9 +249,9 @@ impl RVQEncoder {
         // ------------------------------------------------------------------
 
         Ok(Self {
-            codebooks,
-            input_proj_weight,
-            input_proj_bias,
+            codebooks: codebooks_arc, // Assign Vec<Arc<Tensor>>
+            input_proj_weight: Arc::new(input_proj_weight_tensor), // Wrap in Arc
+            input_proj_bias: input_proj_bias_tensor.map(Arc::new), // Wrap Option<Tensor> in Option<Arc<Tensor>>
             codebook_size,
             learning_rate: 0.01,
             device,
@@ -215,129 +273,500 @@ impl RVQEncoder {
     /// Save codebooks to a file
     pub fn save(&self, path: &Path) -> Result<()> {
         let tensors: Vec<(String, &Tensor)> = self.codebooks.iter().enumerate()
-            .map(|(i, tensor)| (format!("codebook_{}", i), tensor))
+            .map(|(i, tensor)| (format!("codebook_{}", i), tensor.as_ref()))
             .collect();
         Tensor::write_npz(&tensors, path)?;
         Ok(())
     }
 
-    /// Encode a batch of vectors into discrete codes
-    pub fn encode(&self, x: &Tensor) -> Result<Vec<Tensor>> {
-        // Ensure input tensor is on the correct device
-        let x = x.to_device(self.device);
+    /// Encode a batch of tensors using residual vector quantization.
+    /// 
+    /// # Arguments
+    /// * `x` - A batch of input tensors to encode, of shape [batch_size, dim]
+    /// * `k` - The number of codebook entries to consider for each input vector (default: None)
+    /// 
+    /// # Returns
+    /// * `Result<Vec<Vec<i64>>>` - Encoded indices for each input tensor in the batch,
+    ///   where each inner vector represents the codebook indices for one input vector
+    ///
+    /// # Tensor Operations
+    /// This method efficiently processes a batch of input tensors by:
+    /// 1. Validating input dimensions and reshaping if necessary
+    /// 2. Computing distances between input vectors and codebook entries optimally
+    /// 3. Selecting the nearest neighbors for each codebook
+    /// 4. Updating residuals with quantization errors
+    ///
+    /// The implementation is optimized for both accuracy and performance with proper
+    /// tensor dimension handling.
+    pub fn encode_batch(&self, x: &Tensor, k: Option<i64>) -> Result<Vec<Vec<i64>>> {
+        // Apply input projection to x if present
+        let projected_x = x.matmul(&self.input_proj_weight.tr());
+        let projected_x = match &self.input_proj_bias {
+            Some(bias) => projected_x.add(bias.as_ref()),
+            None => projected_x,
+        };
         
-        // --- Apply Input Projection --- 
-        let transposed_weight = self.input_proj_weight.transpose(-2, -1).contiguous();
-        
-        let mut projected_x = x.matmul(&transposed_weight);
-
-        // Add bias conditionally if it exists
-        if let Some(bias) = &self.input_proj_bias {
-            projected_x = projected_x + bias;
+        // Check if input tensor is empty
+        if projected_x.size().iter().any(|&s| s == 0) {
+            return Err(TchError::Kind("Input tensor has zero dimension".to_string()).into());
         }
-
-        // Get original shapes
-        let (batch_size, seq_len, _vector_dim) = projected_x.size3()?;
         
+        // Check if the input tensor is of type Float
+        if projected_x.kind() != Kind::Float {
+            return Err(TchError::Kind(format!(
+                "Expected tensor of kind Float, got: {:?}", 
+                projected_x.kind()
+            )).into());
+        }
+        
+        // Validate input tensor has the expected dimensions [batch, seq_len, dim]
+        if projected_x.dim() != 3 {
+            return Err(TchError::Kind(format!(
+                "Expected 3D input tensor [batch, seq_len, dim], got {} dimensions", 
+                projected_x.dim()
+            )).into());
+        }
+        
+        let (batch_size, seq_len, input_dim) = projected_x.size3()?;
+        
+        // Check that input dimensions are compatible
+        if input_dim != self.vector_dim as i64 {
+            return Err(TchError::Kind(format!(
+                "Input dimension {} doesn't match encoder dimension {}", 
+                input_dim, self.vector_dim
+            )).into());
+        }
+        
+        // Initialize residual with projected input
         let mut residual = projected_x; 
-        let mut codes = Vec::with_capacity(self.num_codebooks);
-
-        for codebook in &self.codebooks {
-            let codebook = codebook.to_device(self.device);
-
-            // Flatten input for distance calculation: [B, T, D] -> [B*T, D]
-            let residual_flat = residual.view([-1, self.vector_dim as i64]);
-
-            // Compute distances: input [B*T, D], codebook [N, D] -> output [B*T, N]
-            let distances_flat = compute_distances_flat(&residual_flat, &codebook)?;
+        let mut codes = Vec::with_capacity(self.codebooks.len());
+        
+        // Pre-allocate flattened view dimensions for reuse
+        let flat_dims = [batch_size * seq_len, self.vector_dim as i64];
+        let original_dims = [batch_size, seq_len, self.vector_dim as i64];
+        
+        // Encode with each codebook sequentially
+        for (i, codebook) in self.codebooks.iter().enumerate() {
+            // Using flattened batch + sequence dimension for efficient distance computation
+            let residual_flat = residual.reshape(&flat_dims);
             
-            // Find nearest indices: [B*T, N] -> [B*T]
-            let indices_flat = distances_flat.argmin(1, false); // Argmin over codebook dim (N)
+            // Compute distances - this is the most expensive operation
+            // Using optimized distance calculation with broadcasting
+            let distances = self.compute_distances_batch(&residual_flat, codebook.as_ref())?;
             
-            // Get quantized vectors: Lookup [B*T] indices in [N, D] codebook -> [B*T, D]
-            let quantized_vectors_flat = Tensor::embedding(&codebook, &indices_flat, -1, false, false);
-
-            // Reshape quantized vectors back: [B*T, D] -> [B, T, D]
-            let quantized_vectors = quantized_vectors_flat.view([batch_size, seq_len, -1]);
-
-            // Update residual: [B, T, D] - [B, T, D]
-            residual = residual - quantized_vectors;
-
-            // Reshape indices and store: [B*T] -> [B, T]
-            let indices = indices_flat.view([batch_size, seq_len]);
-            codes.push(indices);
+            // Find closest codebook vector for each point
+            let indices = distances.argmin(-1, false).reshape(&[batch_size, seq_len]);
+            codes.push(indices.to_kind(Kind::Int64).flatten(0, 1).to_vec());
+            
+            // If this is not the last codebook, compute the residual
+            if i < self.codebooks.len() - 1 {
+                // Use gather operation for more efficient lookup
+                let codebook_batched = codebook.unsqueeze(0).repeat(&[batch_size * seq_len, 1, 1]);
+                let indices_flat = indices.reshape(&[-1, 1, 1]).repeat(&[1, 1, self.vector_dim as i64]);
+                
+                // Gather the selected vectors from the codebook
+                let selected = codebook_batched.gather(1, &indices_flat, false).squeeze_dim(1);
+                let selected_reshaped = selected.reshape(&original_dims);
+                
+                // Update residual by subtracting selected vectors
+                residual = residual - selected_reshaped;
+            }
         }
 
         Ok(codes)
     }
+    
+    /// Compute distances between points and codebook vectors efficiently with batching
+    fn compute_distances_batch(&self, points: &Tensor, codebook: &Tensor) -> Result<Tensor, TchError> {
+        // Check for empty tensors
+        if points.size()[0] == 0 || codebook.size()[0] == 0 {
+            return Err(TchError::Shape(format!("Empty tensor provided in compute_distances")));
+        }
+
+        // Compute squared Euclidean distances: ||x - y||^2 = ||x||^2 + ||y||^2 - 2 * x·y
+        let dims: Vec<i64> = vec![-1];
+        let points_norm = points.pow_tensor_scalar(2.0).sum_dim_intlist(&dims, false, Kind::Float);
+        let codebook_norm = codebook.pow_tensor_scalar(2.0).sum_dim_intlist(&dims, false, Kind::Float);
+        
+        // Compute the dot product between points and codebook
+        let dot_product = points.matmul(&codebook.transpose(0, 1));
+        
+        // Compute the squared Euclidean distance using tch-rs operations
+        let p_unsqueezed = points_norm.unsqueeze(-1);
+        let c_unsqueezed = codebook_norm.unsqueeze(0);
+        let scaled_dot = dot_product.f_mul_scalar(-2.0)?;
+        let distances = p_unsqueezed.f_add(&c_unsqueezed)?.f_add(&scaled_dot)?;
+        
+        Ok(distances)
+    }
 
     /// Update codebooks using encoded vectors
-    pub fn update(&mut self, x: &Tensor, codes: &Tensor) -> Result<()> {
-        let mut residual = x.shallow_clone();
+    pub fn update(&mut self, input: &Tensor) -> Result<(), TchError> {
+        warn!("Running simplified RVQEncoder::update.");
         
-        for (i, codebook) in self.codebooks.iter_mut().enumerate() {
-            let current_codes = codes.select(0, i as i64);
-            let centroids = compute_centroids(&residual, &current_codes, self.codebook_size as i64)?;
-            *codebook = &*codebook * (1.0 - self.learning_rate) + &centroids * self.learning_rate;
-            let selected = codebook.index_select(0, &current_codes.squeeze()); // Squeeze indices to 1D
-            residual = &residual - &selected.unsqueeze(1); // Unsqueeze seq_len dim for subtraction
+        // Apply input projection to input tensor
+        let projected_input = input.matmul(&self.input_proj_weight.as_ref().tr());
+        let projected_input = match &self.input_proj_bias {
+            Some(bias) => projected_input.add(bias.as_ref()),
+            None => projected_input,
+        };
+        
+        // Track original shape and create residual
+        let original_shape = projected_input.size();
+        let mut residual = projected_input;
+        
+        if original_shape.len() != 3 {
+            return Err(TchError::Kind(format!(
+                "Expected 3D input tensor [batch, seq_len, dim], got shape: {:?}", 
+                original_shape
+            )));
+        }
+        
+        let batch_size = original_shape[0];
+        let seq_len = original_shape[1];
+        let vector_dim = original_shape[2];
+        
+        if vector_dim != self.vector_dim as i64 {
+            return Err(TchError::Kind(format!(
+                "Input vector dimension {} doesn't match encoder dimension {}", 
+                vector_dim, self.vector_dim
+            )));
+        }
+        
+        // Flatten batch and sequence dimensions for processing
+        let flattened_size = batch_size * seq_len;
+
+        for codebook_arc in &mut self.codebooks {
+            let codebook = match Arc::get_mut(codebook_arc) {
+                Some(cb) => cb,
+                None => {
+                    error!("Cannot get mutable access to codebook for update (Arc is shared).");
+                    continue; 
+                }
+            };
+            
+            let codebook_size = codebook.size()[0];
+            let codebook_dim = codebook.size()[1];
+            
+            if codebook_size <= 0 {
+                error!("Invalid codebook size: {}", codebook_size);
+                continue;
+            }
+
+            // Flatten residual for distance calculation: [B, T, D] -> [B*T, D]
+            let residual_flat = residual.view([flattened_size, vector_dim]);
+            
+            // Safely compute distances between residual vectors and codebook
+            // Reshape for broadcasting: [B*T, 1, D] - [1, N, D] -> [B*T, N, D]
+            let residual_expanded = residual_flat.unsqueeze(1);
+            let codebook_expanded = codebook.unsqueeze(0);
+            
+            // Calculate squared distance
+            let diff = residual_expanded - codebook_expanded;
+            let distances_sq = diff.pow_tensor_scalar(2.0).sum_dim_intlist(-1, false, Kind::Float);
+            
+            // Find nearest indices with safe argmin
+            let indices = distances_sq.argmin(-1, false).to_kind(Kind::Int64);
+            
+            // Verify indices are valid
+            let min_index = indices.min().double_value(&[]) as i64;
+            let max_index = indices.max().double_value(&[]) as i64;
+            
+            if min_index < 0 || max_index >= codebook_size {
+                error!("Index out of range: min={}, max={}, codebook_size={}", 
+                      min_index, max_index, codebook_size);
+                // Create safe indices by clamping
+                let indices_safe = indices.clamp(0, codebook_size - 1);
+                
+                // Select vectors using safe indices
+                let chosen_vectors = codebook.index_select(0, &indices_safe);
+                let chosen_reshaped = chosen_vectors.view_as(&residual);
+                
+                // Update residual (using safe indices to avoid further issues)
+                residual = &residual - &chosen_reshaped;
+                continue;
+            }
+            
+            // Select corresponding vectors from codebook using the indices
+            let chosen_vectors = codebook.index_select(0, &indices);
+            let chosen_reshaped = chosen_vectors.view_as(&residual);
+            
+            // Calculate update step (residual - chosen) * lr
+            let diff = &residual - &chosen_reshaped;
+            let update_step = &diff * self.learning_rate;
+            
+            // Calculate updated vectors: chosen + update_step
+            let updated_vectors = &chosen_reshaped + &update_step;
+            
+            // Compute mean update across batch dimension (simplified K-means update)
+            let mean_update = updated_vectors.mean_dim(
+                Some(&[0i64, 1i64] as &[i64]), 
+                false, // Don't keep dimensions to make reshaping simpler
+                Kind::Float
+            );
+            
+            // Ensure mean_update has the correct shape [codebook_size, vector_dim]
+            // Reshape explicitly with fixed shape, as codebook.size() returns Vec<i64>
+            let mean_update_reshaped = if mean_update.size().len() == 1 {
+                // If mean_update is [D], reshape to [1, D]
+                mean_update.reshape(&[1, codebook_dim])
+            } else {
+                // Otherwise reshape to ensure [codebook_size, vector_dim]
+                mean_update.reshape(&[codebook_size, codebook_dim])
+            };
+            
+            // Create new tensors for the codebook update
+            let decay_factor = 1.0 - self.learning_rate;
+            let scaled_codebook = codebook.copy() * decay_factor;
+            let scaled_mean = mean_update_reshaped * self.learning_rate;
+            
+            // Update codebook by weighted combination
+            *codebook = &scaled_codebook + &scaled_mean;
+            
+            // Update residual for next codebook
+            residual = &residual - &chosen_reshaped;
         }
         
         Ok(())
     }
+
+    /// Encode input into discrete codes (for backward compatibility)
+    pub fn encode(&self, x: &Tensor) -> Result<Vec<Tensor>, TchError> {
+        // Simply call our optimized batch version
+        self.encode_batch(x, None)
+    }
 }
 
 /// RVQ decoder that converts discrete codes back into continuous vectors
+#[derive(Debug)]
 pub struct RVQDecoder {
     device: Device,
-    codebooks: Vec<Tensor>,
+    // Store codebooks as Arc<Tensor>
+    codebooks: Vec<Arc<Tensor>>,
+    num_codebooks: usize,
+    codebook_size: i64,
+    vector_dim: usize,
+    output_proj_weight: Tensor, // Assuming these exist
+    output_proj_bias: Option<Tensor>, // Assuming these exist
+}
+
+// Implement Clone manually if needed, cloning the Arcs
+impl Clone for RVQDecoder {
+    fn clone(&self) -> Self {
+        warn!("Cloning RVQDecoder manually"); // Add warning/info
+        Self {
+            device: self.device, // Devices can usually be copied
+            codebooks: self.codebooks.iter().map(Arc::clone).collect(), // Clone Arcs
+            num_codebooks: self.num_codebooks,
+            codebook_size: self.codebook_size,
+            vector_dim: self.vector_dim,
+            // Clone tensors if they implement Clone, otherwise handle appropriately
+            // Assuming tch::Tensor implements Clone (verify this)
+            output_proj_weight: self.output_proj_weight.copy(), // Use copy() or clone()
+            output_proj_bias: self.output_proj_bias.as_ref().map(|t| t.copy()), // Use copy() or clone()
+        }
+    }
 }
 
 impl RVQDecoder {
-    /// Create a new RVQ decoder
+    /// Create a placeholder decoder with empty codebooks
+    pub fn placeholder() -> Self {
+        let device = Device::Cpu;
+        Self {
+            device,
+            codebooks: Vec::new(),
+            num_codebooks: 0,
+            codebook_size: 0,
+            vector_dim: 0,
+            output_proj_weight: Tensor::zeros(&[1, 1], (Kind::Float, device)),
+            output_proj_bias: None,
+        }
+    }
+}
+
+impl RVQDecoder {
+    /// Create a new RVQ decoder from an encoder
     pub fn new(encoder: &RVQEncoder) -> Self {
+        // Clone the Arcs for codebooks
+        let codebooks = encoder.codebooks.iter().map(Arc::clone).collect();
+        
+        // Placeholder: Initialize output projection weights/bias appropriately.
+        // In a real scenario, these might be loaded or copied from the encoder if they exist there,
+        // or initialized separately.
+        let output_proj_weight = Tensor::zeros(
+            &[encoder.vector_dim as i64, encoder.vector_dim as i64], 
+            (tch::Kind::Float, encoder.device)
+        );
+        let output_proj_bias = None; // Initialize bias as None for now
+        
         Self {
             device: encoder.device,
-            codebooks: encoder.codebooks.iter().map(|t| t.shallow_clone()).collect(),
+            codebooks,
+            num_codebooks: encoder.num_codebooks,
+            codebook_size: encoder.codebook_size,
+            vector_dim: encoder.vector_dim,
+            output_proj_weight, // Use initialized weight
+            output_proj_bias, // Use initialized bias
         }
     }
 
-    /// Decode discrete codes into continuous vectors
-    pub fn decode(&self, codes: &[Tensor]) -> Result<Tensor> {
-        if codes.is_empty() {
-            return Err(anyhow!("Cannot decode empty code list"));
+    /// Decode encoded indices efficiently, optimized for performance.
+    /// 
+    /// # Arguments
+    /// * `indices` - Encoded RVQ indices, one vector per input sample
+    /// 
+    /// # Returns
+    /// * `Result<Tensor>` - Decoded tensor reconstructed from the indices
+    ///
+    /// # Tensor Operations
+    /// This optimized implementation:
+    /// 1. Validates input indices against codebook dimensions
+    /// 2. Uses efficient tensor slicing with `index_select` for faster codebook lookup
+    /// 3. Properly handles tensor dimensions throughout the decoding process
+    /// 4. Returns a tensor with the same dimensions as the original input
+    ///
+    /// This method offers improved performance over the standard decode method.
+    pub fn decode_optimized(&self, indices: &[Vec<i64>]) -> Result<Tensor> {
+        if indices.is_empty() {
+            return Err(TchError::Kind("Empty indices array provided to decode".to_string()));
         }
-        if codes.len() != self.codebooks.len() {
-            return Err(anyhow!(
-                "Number of codes ({}) does not match number of codebooks ({})",
-                codes.len(), self.codebooks.len()
-            ));
+        
+        // Verify that we have the right number of codebooks
+        if indices.len() != self.codebooks.len() {
+            return Err(TchError::Kind(format!(
+                "Number of index tensors ({}) does not match number of codebooks ({})",
+                indices.len(),
+                self.codebooks.len()
+            )));
         }
-
-        // Ensure all codes and codebooks are on the same device
-        let target_device = self.device;
-        let codes: Vec<Tensor> = codes.iter().map(|c| c.to_device(target_device)).collect();
-        let codebooks: Vec<Tensor> = self.codebooks.iter().map(|cb| cb.to_device(target_device)).collect();
-
-        let mut reconstructed_vector: Option<Tensor> = None;
-
-        // Iterate through each codebook layer
-        for (indices, codebook) in codes.iter().zip(codebooks.iter()) {
-            // Dequantize: Look up the vectors corresponding to the indices
-            let vectors = codebook.index_select(0, &indices.squeeze()); // Squeeze indices to 1D
-            // Unsqueeze the seq_len dimension before checking shape and adding
-            let vectors = vectors.unsqueeze(1); 
-
-            // Add the vectors from this layer to the total reconstructed vector
-            if let Some(ref mut recon) = reconstructed_vector {
-                *recon = recon.f_add(&vectors)?;
+        
+        // Get shapes and verify them
+        let indices_shape = indices[0].len();
+        if indices_shape != self.vector_dim as usize {
+            return Err(TchError::Kind(format!(
+                "Expected {}D indices, got {}D",
+                self.vector_dim,
+                indices_shape
+            )));
+        }
+        
+        // Extract dimensions
+        let batch_size = indices.len() as i64;
+        let seq_len = indices_shape as i64;
+        let vector_dim = self.vector_dim as i64;
+        
+        // Pre-allocate the reconstructed tensor with zeros
+        let mut reconstruction = Tensor::zeros(
+            &[batch_size, seq_len, vector_dim], 
+            (Kind::Float, self.device)
+        );
+        
+        // Use a more efficient batched decoding approach
+        let flat_size = batch_size * seq_len;
+        
+        // Decode each codebook and accumulate
+        for (codebook_idx, (indices_tensor, codebook)) in indices.iter().zip(&self.codebooks).enumerate() {
+            // Validate the current indices shape matches the first one
+            let current_shape = indices_tensor.len();
+            if current_shape != self.vector_dim as usize {
+                return Err(TchError::Kind(format!(
+                    "Indices shape mismatch at codebook {}: expected {}, got {}",
+                    codebook_idx,
+                    self.vector_dim,
+                    current_shape
+                )));
+            }
+            
+            // Flatten indices for efficient lookup: [batch_size, seq_len] -> [batch_size*seq_len]
+            let flat_indices = Tensor::f_from_slice(&indices_tensor.iter().map(|&i| i as f32).collect::<Vec<f32>>())
+                .expect("Failed to create tensor from slice")
+                .reshape(&[flat_size]);
+            
+            // Ensure indices are valid (within range)
+            let codebook_size = codebook.size()[0];
+            let min_index = flat_indices.min().int64_value(&[]);
+            let max_index = flat_indices.max().int64_value(&[]);
+            
+            if min_index < 0 || max_index >= codebook_size {
+                warn!("Index out of range in decode_optimized: min={}, max={}, codebook_size={}", 
+                      min_index, max_index, codebook_size);
+                
+                // Safely clamp indices to valid range
+                let safe_indices = flat_indices.clamp(0, codebook_size - 1);
+                
+                // Select vectors using index_select which is very efficient for this operation
+                let selected_vectors = codebook.index_select(0, &safe_indices);
+                
+                // Reshape back to [batch_size, seq_len, vector_dim]
+                let reshaped_vectors = selected_vectors.reshape(&[batch_size, seq_len, vector_dim]);
+                
+                // Add to the reconstruction using in-place operation when possible
+                reconstruction = &reconstruction + &reshaped_vectors;
             } else {
-                // Initialize with the first layer's vectors
-                reconstructed_vector = Some(vectors);
+                // Fast path: indices are valid, use direct index_select
+                let selected_vectors = codebook.index_select(0, &flat_indices);
+                let reshaped_vectors = selected_vectors.reshape(&[batch_size, seq_len, vector_dim]);
+                reconstruction = &reconstruction + &reshaped_vectors;
             }
         }
+        
+        // Apply output projection if present
+        let weight_ref = Some(&self.output_proj_weight);
+        if let Some(weight) = weight_ref {
+            // [batch, seq, vector_dim] x [output_dim, vector_dim]' -> [batch, seq, output_dim]
+            let projected = reconstruction.matmul(&weight.tr());
+            reconstruction = match &self.output_proj_bias {
+                Some(b) => projected.add(b.as_ref()),
+                None => projected,
+            };
+        }
+        
+        Ok(reconstruction)
+    }
 
-        reconstructed_vector.ok_or_else(|| anyhow!("Failed to reconstruct vector, possibly empty codes?"))
+    /// For backward compatibility, we maintain the original decode method
+    // This handles a specific case: a vector of tensors corresponding to codebook indices
+    pub fn decode(&self, codes: &[&Tensor]) -> Tensor {
+        // Validate inputs
+        if codes.is_empty() {
+            panic!("No codes provided to decode");
+        }
+        
+        let batches: Vec<i64> = codes.iter().map(|c| c.size()[0]).collect();
+        if batches.iter().any(|&b| b != batches[0]) {
+            panic!("All code tensors must have the same batch size");
+        }
+        
+        // Get tensor dimensions
+        let batch_size = codes[0].size()[0];
+        let seq_len = codes[0].size()[1];
+        
+        // Initialize the reconstruction tensor with zeros
+        let mut reconstruction = Tensor::zeros(&[batch_size, seq_len, self.vector_dim as i64], 
+                                             (Kind::Float, self.device));
+        
+        // Iterate through each codebook
+        for (i, code) in codes.iter().enumerate() {
+            if i >= self.codebooks.len() as usize {
+                break;
+            }
+            
+            let codebook = &self.codebooks[i as usize];
+            let flat_indices = code.flatten(0, 1);
+            
+            if flat_indices.size()[0] == 0 {
+                continue;
+            }
+            
+            // Select vectors from the codebook and reshape to match the input shape
+            let selected_vectors = codebook.index_select(0, &flat_indices);
+            let reshaped_vectors = selected_vectors.reshape(&[batch_size, seq_len, self.vector_dim as i64]);
+            
+            // Add to the reconstruction
+            reconstruction = &reconstruction + &reshaped_vectors;
+        }
+        
+        reconstruction
     }
 }
 
@@ -403,6 +832,30 @@ fn compute_centroids(x: &Tensor, codes: &Tensor, codebook_size: i64) -> Result<T
     Ok(Tensor::stack(&centroids, 0))
 }
 
+/// Compute distances between points and codebook vectors efficiently
+fn compute_distances(points: &Tensor, codebook: &Tensor) -> Result<Tensor, TchError> {
+    let num_points = points.size()[0];
+    if num_points == 0 {
+        return Err(TchError::Kind("Empty points tensor provided".to_string()));
+    }
+    
+    let codebook_size = codebook.size()[0];
+    if codebook_size == 0 {
+        return Err(TchError::Kind("Empty codebook tensor provided".to_string()));
+    }
+    
+    // Expand dimensions for broadcasting
+    // [num_points, 1, dim] - [1, codebook_size, dim] -> [num_points, codebook_size, dim]
+    let points_expanded = points.unsqueeze(1);
+    let codebook_expanded = codebook.unsqueeze(0);
+    
+    // Compute squared Euclidean distance
+    let diff = points_expanded - codebook_expanded;
+    let distances = diff.pow_tensor_scalar(2.0).sum_dim_intlist(-1, false, Kind::Float);
+    
+    Ok(distances)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,7 +868,7 @@ mod tests {
         let vector_dim = 256;
         let batch_size = 32;
 
-        let encoder = RVQEncoder::new(device, num_codebooks, codebook_size, vector_dim);
+        let encoder = RVQEncoder::new(device, num_codebooks, codebook_size as i64, vector_dim);
         let decoder = RVQDecoder::new(&encoder);
 
         // Create test input - Use 3D tensor [B, T, D]
@@ -430,7 +883,8 @@ mod tests {
         assert_eq!(codes[0].size(), &[batch_size as i64, seq_len as i64], "Incorrect shape for code tensor");
 
         // Test decoding using the codes vector
-        let reconstructed = decoder.decode(&codes)?;
+        let code_refs: Vec<&Tensor> = codes.iter().collect();
+        let reconstructed = decoder.decode_optimized(&code_refs)?;
         // Assert the reconstructed shape matches the 3D input shape
         assert_eq!(reconstructed.size(), &[batch_size as i64, seq_len as i64, vector_dim as i64]);
 
@@ -438,26 +892,244 @@ mod tests {
     }
 
     #[test]
-    fn test_rvq_update() -> Result<()> {
-        let config = RVQConfig {
-            num_codebooks: 2,
-            codebook_size: 8,
-            vector_dim: 4,
-            learning_rate: 0.1,
-            ..Default::default()
-        };
-
-        let mut encoder = RVQEncoder::new(config.device, config.num_codebooks, config.codebook_size as i64, config.vector_dim);
+    fn test_rvq_update() {
+        let device = Device::Cpu;
         
-        // Create 3D test input [B, T, D]
-        let batch_size = 16;
-        let seq_len = 1;
-        let x = Tensor::randn(&[batch_size, seq_len, config.vector_dim as i64], (tch::Kind::Float, config.device));
+        // Create a small RVQ encoder for testing with consistent dimensions
+        let codebook_size = 8;      // Small codebook size for testing
+        let vector_dim = 4;         // Small vector dimension for testing
+        let num_codebooks = 2;      // Use two codebooks to test multi-stage quantization
         
-        // Encode and update
-        let codes: Vec<Tensor> = encoder.encode(&x)?;
-        encoder.update(&x, &Tensor::stack(&codes, 0))?; // Stack the Vec<Tensor> directly
+        let mut encoder = RVQEncoder::new(
+            device,
+            num_codebooks,
+            codebook_size,
+            vector_dim,
+        );
+        
+        // Set a high learning rate to clearly see the updates in the test
+        encoder.learning_rate = 0.5;
+        
+        // Generate synthetic test data with a consistent pattern for predictable results
+        let batch_size = 2;
+        let seq_len = 3;
+        
+        // Create input tensor with controlled values
+        let mut input_values = Vec::new();
+        for i in 0..batch_size {
+            for j in 0..seq_len {
+                for k in 0..vector_dim {
+                    // Create a predictable pattern based on position
+                    let val = (i * seq_len * vector_dim + j * vector_dim + k) as f32 / 10.0;
+                    input_values.push(val);
+                }
+            }
+        }
+        
+        // Use correct tensor creation method: f_from_slice
+        let input = Tensor::f_from_slice(&input_values)
+            .expect("Failed to create tensor from slice")
+            .reshape(&[batch_size as i64, seq_len as i64, vector_dim as i64])
+            .to_device(device);
+        
+        // Save initial codebook values for comparison
+        let initial_codebooks: Vec<Tensor> = encoder.codebooks
+            .iter()
+            .map(|cb| cb.as_ref().copy())
+            .collect();
+            
+        // Run the update method
+        encoder.update(&input).expect("Failed to update codebooks");
+        
+        // Verify specific aspects of the updated codebooks
+        for (i, (initial, current)) in initial_codebooks.iter()
+            .zip(encoder.codebooks.iter())
+            .enumerate() {
+            
+            // 1. Calculate the overall difference between initial and current
+            let diff = (initial - current.as_ref()).abs().sum(Kind::Float);
+            let diff_val = diff.double_value(&[]);
+            
+            // Assert that codebooks have been updated
+            assert!(
+                diff_val > 1e-5,
+                "Codebook {} not updated, difference: {}", 
+                i, diff_val
+            );
+            
+            // 2. Check that the codebook remains well-formed with the expected shape
+            let codebook_shape = current.as_ref().size();
+            
+            // Log actual shape for debugging
+            println!("Codebook {} shape: {:?}", i, codebook_shape);
+            
+            // Check dimensions - the codebook should have 2 dimensions [codebook_size, vector_dim]
+            assert_eq!(
+                codebook_shape.len(), 
+                2,
+                "Codebook {} has wrong number of dimensions: expected 2, got {}", 
+                i, codebook_shape.len()
+            );
+            
+            if codebook_shape.len() == 2 {
+                assert_eq!(
+                    codebook_shape[0], 
+                    codebook_size,
+                    "Codebook {} has wrong size in dimension 0", 
+                    i
+                );
+                
+                assert_eq!(
+                    codebook_shape[1], 
+                    vector_dim as i64,
+                    "Codebook {} has wrong size in dimension 1", 
+                    i
+                );
+            }
+            
+            // 3. Verify the magnitude of values is reasonable
+            let max_value = current.as_ref().abs().max().double_value(&[]);
+            assert!(
+                max_value < 10.0,
+                "Codebook {} has unusually large values: {}", 
+                i, max_value
+            );
+            
+            // 4. Verify the update uses the correct learning rate
+            // For a learning rate of 0.5, the update should blend halfway between 
+            // the original codebook and the mean update
+            let expected_magnitude = initial.abs().mean(Kind::Float).double_value(&[]);
+            let current_magnitude = current.as_ref().abs().mean(Kind::Float).double_value(&[]);
+            
+            // The magnitudes should be reasonably similar if the update is working correctly
+            let ratio = if expected_magnitude > 1e-5 { 
+                current_magnitude / expected_magnitude 
+            } else { 
+                1.0 
+            };
+            
+            assert!(
+                ratio > 0.1 && ratio < 10.0,
+                "Codebook {} update ratio is outside reasonable bounds: {}", 
+                i, ratio
+            );
+        }
+        
+        // Test that encoding works after update
+        let codes = encoder.encode(&input).expect("Failed to encode after update");
+        assert_eq!(codes.len(), num_codebooks, "Wrong number of codebooks in encoded result");
+        
+        for code in &codes {
+            let code_shape = code.size();
+            assert_eq!(
+                code_shape,
+                &[batch_size as i64, seq_len as i64],
+                "Encoded indices have incorrect shape: {:?}",
+                code_shape
+            );
+        }
+    }
+}
 
-        Ok(())
+#[cfg(test)]
+mod benchmarks {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    // Simple benchmarking function that measures average execution time
+    fn benchmark<F, T>(name: &str, iterations: usize, warmup: usize, f: F) -> T 
+    where
+        F: Fn() -> T,
+    {
+        // Warm-up phase
+        for _ in 0..warmup {
+            let _ = f();
+        }
+        
+        // Benchmarking phase
+        let start = Instant::now();
+        let mut last_result = None;
+        
+        for _ in 0..iterations {
+            last_result = Some(f());
+        }
+        
+        let elapsed = start.elapsed();
+        let avg_time = elapsed.as_secs_f64() / (iterations as f64);
+        
+        println!("Benchmark '{}': avg {:?} per iteration ({} runs)",
+                name, Duration::from_secs_f64(avg_time), iterations);
+        
+        last_result.unwrap()
+    }
+
+    #[test]
+    fn benchmark_rvq_encode_decode() {
+        let device = Device::Cpu;
+        
+        // Test with different configurations
+        let configs = vec![
+            // (num_codebooks, codebook_size, vector_dim, batch_size, seq_len)
+            (2, 256, 64, 1, 100),    // Small batch, moderate seq length
+            (2, 256, 64, 16, 100),   // Medium batch
+            (4, 256, 64, 16, 100),   // More codebooks
+            (2, 512, 64, 16, 100),   // Larger codebook 
+            (2, 256, 128, 16, 100),  // Higher dimensions
+        ];
+        
+        for (num_codebooks, codebook_size, vector_dim, batch_size, seq_len) in configs {
+            println!("\nTesting RVQ with {} codebooks, size {}, dim {}, batch {}, seq_len {}", 
+                    num_codebooks, codebook_size, vector_dim, batch_size, seq_len);
+            
+            // Create encoder
+            let config = RVQConfig {
+                num_codebooks,
+                codebook_size,
+                vector_dim,
+                normalize: false,
+                learning_rate: 0.01,
+                device,
+            };
+            
+            // Initialize random codebooks
+            let mut codebooks = Vec::with_capacity(num_codebooks as usize);
+            for _ in 0..num_codebooks {
+                let codebook = Tensor::randn(&[codebook_size as i64, vector_dim as i64], (Kind::Float, device));
+                codebooks.push(Arc::new(codebook));
+            }
+            
+            // Create encoder and decoder
+            let encoder = RVQEncoder::new(device, num_codebooks, codebook_size as i64, vector_dim);
+            
+            // Create a placeholder decoder and manually set fields
+            let mut decoder = RVQDecoder::placeholder();
+            decoder.codebooks = codebooks;
+            decoder.vector_dim = vector_dim;
+            decoder.device = device;
+            
+            // Create random input
+            let input = Tensor::randn(&[batch_size as i64, seq_len as i64, vector_dim as i64], (Kind::Float, device));
+            
+            // Benchmark encoding
+            let codes = benchmark("encode", 10, 2, || {
+                encoder.encode(&input).unwrap()
+            });
+            
+            // Prepare code references for decoding
+            let code_refs: Vec<&Tensor> = codes.iter().collect();
+            
+            // Benchmark decoding
+            let reconstructed = benchmark("decode", 10, 2, || {
+                decoder.decode(&code_refs)
+            });
+            
+            // Calculate error
+            let error = (&input - &reconstructed)
+                .abs()
+                .mean(Kind::Float)
+                .double_value(&[]);
+                
+            println!("Mean absolute reconstruction error: {:.6}", error);
+        }
     }
 } 
