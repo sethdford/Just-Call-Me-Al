@@ -517,13 +517,13 @@ impl RVQEncoder {
                 mean_update.reshape(&[codebook_size, codebook_dim])
             };
             
-            // Create new tensors for the codebook update
+            // Fix: Create new tensors without referencing the original and avoid &codebook + &mean_update issues
             let decay_factor = 1.0 - self.learning_rate;
             let scaled_codebook = codebook.copy() * decay_factor;
-            let scaled_mean = mean_update_reshaped * self.learning_rate;
+            let scaled_update = mean_update_reshaped * self.learning_rate;
             
-            // Update codebook by weighted combination
-            *codebook = &scaled_codebook + &scaled_mean;
+            // Create a new tensor from the addition and assign it directly to codebook
+            *codebook = &scaled_codebook + &scaled_update;
             
             // Update residual for next codebook
             residual = &residual - &chosen_reshaped;
@@ -812,33 +812,93 @@ fn find_nearest(distances: &Tensor, codebook: &Tensor) -> Result<(Tensor, Tensor
     Ok((indices.squeeze_dim(-1), values))
 }
 
-fn compute_centroids(x: &Tensor, codes: &Tensor, codebook_size: i64) -> Result<Tensor> {
-    // x shape: [B, T, D]
-    // codes shape: [B, T] (after squeeze in update)
-    // Prefix unused variables
-    let (_batch_size, _seq_len, vector_dim) = x.size3()?;
+/// Computes centroids (centers) of residual vectors for each code in the given codes tensor
+fn compute_centroids(x: &Tensor, codes: &Tensor) -> Result<Tensor, TchError> {
+    // Validate inputs
+    let x_size = x.size();
+    let codes_size = codes.size();
     
-    // Reshape x to [B*T, D]
-    let x_flat = x.reshape(&[-1, vector_dim]);
-    // Reshape codes to [B*T]
-    let codes_flat = codes.reshape(&[-1]);
-
-    let mut centroids = Vec::new();
-    // Sum over the flattened batch*sequence dimension (dim 0)
-    let dims: &[i64] = &[0]; 
-    
-    for i in 0..codebook_size {
-        let mask = codes_flat.eq(i);
-        // Need mask shape [B*T, 1] for broadcasting with x_flat [B*T, D]
-        let mask_unsqueezed = mask.unsqueeze(-1);
-        
-        // Perform calculation on flattened tensors
-        let sum = (&x_flat * &mask_unsqueezed).sum_dim_intlist(dims, false, tch::Kind::Float);
-        let count = mask.sum_dim_intlist(dims, false, tch::Kind::Float).clamp_min(1e-12);
-        centroids.push(sum / count);
+    if x_size.len() != 2 {
+        return Err(TchError::Kind(format!(
+            "Expected 2D input tensor [B*T, D], got shape: {:?}", 
+            x_size
+        )));
     }
     
-    Ok(Tensor::stack(&centroids, 0))
+    if codes_size.len() != 1 {
+        return Err(TchError::Kind(format!(
+            "Expected 1D codes tensor [B*T], got shape: {:?}", 
+            codes_size
+        )));
+    }
+    
+    if x_size[0] != codes_size[0] {
+        return Err(TchError::Kind(format!(
+            "Input tensor first dimension ({}) must match codes length ({})",
+            x_size[0], codes_size[0]
+        )));
+    }
+    
+    let codes_flat = codes.to_kind(Kind::Int64).flatten(0, -1);
+    
+    // Check for empty inputs
+    if codes_flat.size()[0] == 0 {
+        return Err(TchError::Kind("Empty codes tensor".to_string()));
+    }
+    
+    // Get min and max code values, handling errors properly
+    let min_code_tensor = codes_flat.min();
+    let max_code_tensor = codes_flat.max();
+    
+    // Safe extraction of int64 values
+    let min_code = min_code_tensor.int64_value(&[]);
+    let max_code = max_code_tensor.int64_value(&[]);
+    
+    if min_code < 0 {
+        return Err(TchError::Kind(format!(
+            "Invalid negative code value found: {}", min_code
+        )));
+    }
+    
+    // Determine number of centroids (n) from max code value
+    let n_centroids = max_code + 1;
+    let vector_dim = x_size[1];
+    
+    // Initialize centroids tensor with zeros
+    let centroids = Tensor::zeros(&[n_centroids, vector_dim], (Kind::Float, x.device()));
+    
+    // Count vectors per centroid
+    let counts = Tensor::zeros(&[n_centroids], (Kind::Int64, x.device()));
+    
+    // Create a unique index for each code
+    let indices = codes_flat.to_kind(Kind::Int64);
+    
+    // Sum vectors for each centroid using indexing operations
+    let data_points = x_size[0] as usize;
+    for i in 0..data_points {
+        let idx = i as i64;
+        let code_i = indices.get(idx).int64_value(&[]);
+        if code_i >= 0 && code_i < n_centroids {
+            // Add vector to the corresponding centroid
+            let vector_i = x.get(idx);
+            let current_sum = centroids.get(code_i);
+            let new_sum = &current_sum + &vector_i;
+            centroids.get(code_i).copy_(&new_sum);
+            
+            // Increment count for this centroid
+            let current_count = counts.get(code_i);
+            let new_count = &current_count + 1; // Direct addition of scalar
+            counts.get(code_i).copy_(&new_count);
+        }
+    }
+    
+    // Compute mean by dividing sum by count (avoiding division by zero)
+    let counts_expanded = counts.unsqueeze(-1);
+    let ones = Tensor::ones(&[n_centroids, 1], (Kind::Float, x.device()));
+    let counts_safe = counts_expanded.maximum(&ones);
+    let centroids_normalized = &centroids / &counts_safe;
+    
+    Ok(centroids_normalized)
 }
 
 /// Compute distances between points and codebook vectors efficiently
@@ -868,6 +928,7 @@ fn compute_distances(points: &Tensor, codebook: &Tensor) -> Result<Tensor, TchEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
 
     #[test]
     fn test_rvq_encode_decode() -> Result<()> {
@@ -1046,6 +1107,65 @@ mod tests {
             encoded_indices[0].len()
         );
         
+        Ok(())
+    }
+
+    #[test]
+    fn test_compute_centroids() -> Result<()> {
+        let device = Device::Cpu;
+        
+        // Create test data: 6 vectors each with 2 dimensions
+        let vectors_data: Vec<f32> = vec![
+            1.0, 2.0,   // code 0
+            1.5, 2.5,   // code 0
+            5.0, 6.0,   // code 1
+            6.0, 7.0,   // code 1
+            9.0, 8.0,   // code 2
+            -1.0, 0.0   // code 0
+        ];
+        let vectors = Tensor::f_from_slice(&vectors_data)?.reshape(&[6, 2]).to_device(device);
+        
+        // Assign codes: first 2 to code 0, next 2 to code 1, next to code 2, last to code 0
+        let codes_data: Vec<i64> = vec![0, 0, 1, 1, 2, 0];
+        let codes = Tensor::f_from_slice(&codes_data)?.to_device(device);
+        
+        // Compute centroids
+        let centroids = compute_centroids(&vectors, &codes)?;
+        
+        // Expected results:
+        // Code 0: avg([1.0, 2.0], [1.5, 2.5], [-1.0, 0.0]) = [0.5, 1.5]
+        // Code 1: avg([5.0, 6.0], [6.0, 7.0]) = [5.5, 6.5]
+        // Code 2: avg([9.0, 8.0]) = [9.0, 8.0]
+        
+        // Verify shape: 3 centroids (0, 1, 2) each with 2 dimensions
+        let expected_shape = vec![3, 2];
+        assert_eq!(centroids.size(), expected_shape);
+        
+        // Verify centroid values (with small epsilon for floating point comparison)
+        let epsilon = 1e-5;
+        
+        // Check code 0 centroid
+        let centroid0 = centroids.get(0);
+        let c0_x = centroid0.get(0).double_value(&[]);
+        let c0_y = centroid0.get(1).double_value(&[]);
+        assert!((c0_x - 0.5).abs() < epsilon);
+        assert!((c0_y - 1.5).abs() < epsilon);
+        
+        // Check code 1 centroid
+        let centroid1 = centroids.get(1);
+        let c1_x = centroid1.get(0).double_value(&[]);
+        let c1_y = centroid1.get(1).double_value(&[]);
+        assert!((c1_x - 5.5).abs() < epsilon);
+        assert!((c1_y - 6.5).abs() < epsilon);
+        
+        // Check code 2 centroid
+        let centroid2 = centroids.get(2);
+        let c2_x = centroid2.get(0).double_value(&[]);
+        let c2_y = centroid2.get(1).double_value(&[]);
+        assert!((c2_x - 9.0).abs() < epsilon);
+        assert!((c2_y - 8.0).abs() < epsilon);
+        
+        println!("Centroids test passed!");
         Ok(())
     }
 }
