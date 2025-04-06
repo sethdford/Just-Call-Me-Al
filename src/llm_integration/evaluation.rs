@@ -1,14 +1,17 @@
+#![allow(dead_code)] // Allow dead code for this evaluation/benchmarking module
+
 //! LLM Evaluation and Monitoring System
 //!
 //! This module provides tools for evaluating and monitoring the LLM integration,
 //! including quality metrics, performance monitoring, and diagnostics.
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use anyhow::{Result, Context as AnyhowContext};
-use tokio::sync::Mutex as TokioMutex;
-use tracing::{info, debug, warn, error};
+use std::collections::HashMap;
+use std::time::Instant;
+
+use tokio::sync::RwLock as TokioRwLock;
+use tracing::{info, debug};
+use anyhow::{Result, Context};
 
 use crate::context::ConversationHistory;
 use super::{LlmProcessor, ContextEmbedding};
@@ -148,7 +151,7 @@ impl MetricsTimeSeries {
 #[derive(Debug)]
 pub struct MetricsRegistry {
     /// Metrics time series by metric type
-    metrics: TokioMutex<HashMap<MetricType, MetricsTimeSeries>>,
+    metrics: TokioRwLock<HashMap<MetricType, MetricsTimeSeries>>,
     /// Configuration
     config: MetricsConfig,
 }
@@ -181,14 +184,14 @@ impl MetricsRegistry {
     /// Create a new metrics registry with the given configuration
     pub fn new(config: MetricsConfig) -> Self {
         Self {
-            metrics: TokioMutex::new(HashMap::new()),
+            metrics: TokioRwLock::new(HashMap::new()),
             config,
         }
     }
     
     /// Record a metric reading
     pub async fn record_metric(&self, reading: MetricReading) {
-        let mut metrics = self.metrics.lock().await;
+        let mut metrics = self.metrics.write().await;
         
         // Get or create the time series for this metric
         let time_series = metrics
@@ -206,7 +209,7 @@ impl MetricsRegistry {
                 MetricType::CacheHitRate => "CacheHitRate",
                 MetricType::SuccessRate => "SuccessRate",
                 MetricType::QualityScore => "QualityScore",
-                MetricType::Custom(id) => return,
+                MetricType::Custom(_id) => return,
             };
             
             debug!("{}: {:.2} (metadata: {:?})", metric_name, reading.value, reading.metadata);
@@ -214,7 +217,7 @@ impl MetricsRegistry {
     }
     
     /// Export metrics to a file
-    pub async fn export_metrics(&self) -> Result<()> {
+    pub async fn export_metrics(&self) -> Result<(), anyhow::Error> {
         // Return early if export is disabled
         if !self.config.export_to_file || self.config.export_directory.is_none() {
             return Ok(());
@@ -223,10 +226,10 @@ impl MetricsRegistry {
         // Create export directory if it doesn't exist
         let export_dir = self.config.export_directory.as_ref().unwrap();
         std::fs::create_dir_all(export_dir)
-            .with_context(|| format!("Failed to create export directory: {}", export_dir))?;
+            .context(format!("Failed to create export directory: {}", export_dir))?;
         
         // Export each metric to a separate file
-        let metrics = self.metrics.lock().await;
+        let metrics = self.metrics.read().await;
         for (metric_type, time_series) in metrics.iter() {
             let metric_name = match metric_type {
                 MetricType::Latency => "latency",
@@ -234,12 +237,12 @@ impl MetricsRegistry {
                 MetricType::CacheHitRate => "cache_hit_rate",
                 MetricType::SuccessRate => "success_rate",
                 MetricType::QualityScore => "quality_score",
-                MetricType::Custom(id) => continue,
+                MetricType::Custom(_id) => continue,
             };
             
             let file_path = format!("{}/{}.csv", export_dir, metric_name);
             let mut file = std::fs::File::create(&file_path)
-                .with_context(|| format!("Failed to create file: {}", file_path))?;
+                .context(format!("Failed to create file: {}", file_path))?;
             
             // Write CSV header
             use std::io::Write;
@@ -270,7 +273,7 @@ impl MetricsRegistry {
     
     /// Get metrics report
     pub async fn get_report(&self) -> MetricsReport {
-        let metrics = self.metrics.lock().await;
+        let metrics = self.metrics.read().await;
         let mut report = MetricsReport::new();
         
         for (metric_type, time_series) in metrics.iter() {
@@ -342,7 +345,7 @@ impl MetricsReport {
                 MetricType::CacheHitRate => "Cache Hit Rate (%)",
                 MetricType::SuccessRate => "Success Rate (%)",
                 MetricType::QualityScore => "Quality Score (0-100)",
-                MetricType::Custom(id) => continue,
+                MetricType::Custom(_id) => continue,
             };
             
             result.push_str(&format!("-- {} --\n", metric_name));
@@ -379,7 +382,7 @@ impl InstrumentedLlmProcessor {
 
 /// Implementation of LlmProcessor for InstrumentedLlmProcessor
 impl LlmProcessor for InstrumentedLlmProcessor {
-    fn generate_embeddings(&self, context: &ConversationHistory) -> Result<ContextEmbedding> {
+    fn generate_embeddings(&self, context: &ConversationHistory) -> Result<ContextEmbedding, anyhow::Error> {
         let start = Instant::now();
         let result = self.inner.generate_embeddings(context);
         let elapsed = start.elapsed();
@@ -423,7 +426,7 @@ impl LlmProcessor for InstrumentedLlmProcessor {
         result
     }
     
-    fn process_text(&self, text: &str) -> Result<String> {
+    fn process_text(&self, text: &str) -> Result<String, anyhow::Error> {
         let start = Instant::now();
         let result = self.inner.process_text(text);
         let elapsed = start.elapsed();
@@ -455,7 +458,7 @@ impl LlmProcessor for InstrumentedLlmProcessor {
         result
     }
     
-    fn generate_response(&self, context: &ConversationHistory) -> Result<String> {
+    fn generate_response(&self, context: &ConversationHistory) -> Result<String, anyhow::Error> {
         let start = Instant::now();
         let result = self.inner.generate_response(context);
         let elapsed = start.elapsed();
@@ -487,7 +490,7 @@ impl LlmProcessor for InstrumentedLlmProcessor {
         result
     }
     
-    fn as_any(&self) -> &dyn std::any::Any {
+    fn _as_any(&self) -> &dyn std::any::Any {
         self
     }
 }
@@ -522,7 +525,7 @@ impl LlmBenchmark {
             "Hello, how are you today?".to_string()
         ));
         history.add_turn(crate::context::ConversationTurn::new(
-            crate::context::Speaker::Model,
+            crate::context::Speaker::Assistant,
             "I'm doing well, thank you for asking! How can I help you today?".to_string()
         ));
         history.add_turn(crate::context::ConversationTurn::new(
@@ -538,7 +541,7 @@ impl LlmBenchmark {
     }
     
     /// Run the benchmark
-    pub fn run(&self) -> Result<BenchmarkResults> {
+    pub fn run(&self) -> Result<BenchmarkResults, anyhow::Error> {
         info!("Running LLM benchmark with {} iterations", self.iterations);
         
         let mut results = BenchmarkResults::new();

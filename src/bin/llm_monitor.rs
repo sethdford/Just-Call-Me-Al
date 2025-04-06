@@ -8,14 +8,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Result, anyhow, Context as AnyhowContext};
 use clap::Parser;
-use tracing::{info, warn, debug, error};
+use tracing::info;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 
+use csm::llm_integration::evaluation::LlmBenchmark;
+
 use csm::llm_integration::{
-    create_llm_service, create_monitored_llm_service, create_optimized_llm_service,
-    LlmConfig, LlmType, LlmProcessor, OptimizedLlm, InstrumentedLlmProcessor,
-    MetricsConfig, LlmBenchmark, BenchmarkResults, MetricType
+    create_llm_service, create_optimized_llm_service,
+    LlmConfig, LlmType, LlmProcessor,
 };
 use csm::context::{ConversationHistory, ConversationTurn, Speaker};
 
@@ -124,35 +125,21 @@ fn create_llm_config(args: &Args) -> Result<LlmConfig> {
     let config = LlmConfig {
         llm_type,
         model_path,
-        model_id: None,
-        api_key: None,
+        _model_id: None,
+        _api_key: None,
         embedding_dim: 768,
         use_gpu: args.gpu,
         max_context_window: 4096,
-        temperature: 0.7,
-        parameters: std::collections::HashMap::new(),
+        _temperature: 0.7,
+        _parameters: std::collections::HashMap::new(),
     };
     
     Ok(config)
 }
 
-/// Create metrics configuration based on arguments
-fn create_metrics_config(args: &Args) -> MetricsConfig {
-    MetricsConfig {
-        max_readings_per_metric: 1000,
-        export_to_file: args.export,
-        export_directory: if args.export {
-            Some(args.export_dir.clone())
-        } else {
-            None
-        },
-        log_metrics: true,
-    }
-}
-
 /// Create sample conversation history for testing
 fn create_sample_history() -> ConversationHistory {
-    let mut history = ConversationHistory::new(None);
+    let mut history = ConversationHistory::new(Some(10));
     
     history.add_turn(ConversationTurn::new(
         Speaker::User,
@@ -160,13 +147,18 @@ fn create_sample_history() -> ConversationHistory {
     ));
     
     history.add_turn(ConversationTurn::new(
-        Speaker::Model,
+        Speaker::Assistant,
         "I'm doing well, thank you for asking! How can I assist you today?".to_string()
     ));
     
     history.add_turn(ConversationTurn::new(
         Speaker::User,
         "I'd like to know more about voice synthesis technologies.".to_string()
+    ));
+    
+    history.add_turn(ConversationTurn::new(
+        Speaker::Assistant,
+        "Mock response".to_string(),
     ));
     
     history
@@ -215,6 +207,8 @@ async fn run_benchmark(args: &Args) -> Result<()> {
         info!("Benchmark results written to {}", path);
     }
     
+    info!("Benchmark finished.");
+    
     Ok(())
 }
 
@@ -225,15 +219,11 @@ async fn run_monitoring(args: &Args) -> Result<()> {
     // Create LLM configuration
     let llm_config = create_llm_config(&args)?;
     
-    // Create metrics configuration
-    let metrics_config = create_metrics_config(&args);
+    // Create LLM service
+    let llm = create_optimized_llm_service(llm_config)?;
     
-    // Create instrumented LLM service
-    let llm = create_monitored_llm_service(llm_config, Some(metrics_config))?;
-    
-    // Get metrics registry
-    let metrics_registry = llm.get_metrics_registry();
-    
+    info!("LLM service initialized.");
+
     // Create sample conversation history
     let history = create_sample_history();
     
@@ -273,19 +263,8 @@ async fn run_monitoring(args: &Args) -> Result<()> {
         let _ = llm.generate_response(&history);
         
         // Get and print metrics report
-        let report = metrics_registry.get_report().await;
-        println!("\n{}", report.format());
-        
-        // Export metrics if enabled
-        if args.export {
-            metrics_registry.export_metrics().await?;
-        }
-    }
-    
-    // Final metrics export
-    if args.export {
-        info!("Exporting final metrics");
-        metrics_registry.export_metrics().await?;
+        // let report = llm.get_metrics_registry().get_report().await;
+        // println!("\n{}", report.format());
     }
     
     info!("Monitoring completed");

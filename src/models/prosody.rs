@@ -9,14 +9,14 @@
 // - ProsodyFM: Unsupervised phrasing and intonation control 
 // - PRESENT: Zero-shot text-to-prosody control
 
-use std::collections::HashMap;
 use tch::{Tensor, Device, Kind, nn};
-use tch::nn::Module;
-use crate::llm_integration::ContextEmbedding;
-use tracing::debug;
+use std::collections::HashMap;
 use serde::{Serialize, Deserialize};
 use std::fmt::Debug;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+use std::cmp::{PartialEq, Eq};
+use tracing::debug;
+use crate::llm_integration::ContextEmbedding;
 
 /// Represent different emotional states for prosody control
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +30,29 @@ pub enum EmotionalTone {
     Disgusted,
     Custom(f32, f32) // Custom emotional tone with valence/arousal parameters
 }
+
+/// Implement PartialEq for EmotionalTone to fix the comparison error
+impl PartialEq for EmotionalTone {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Neutral, Self::Neutral) => true,
+            (Self::Happy, Self::Happy) => true,
+            (Self::Sad, Self::Sad) => true,
+            (Self::Angry, Self::Angry) => true,
+            (Self::Surprised, Self::Surprised) => true,
+            (Self::Fearful, Self::Fearful) => true,
+            (Self::Disgusted, Self::Disgusted) => true,
+            (Self::Custom(v1, a1), Self::Custom(v2, a2)) => {
+                // For Custom, compare both values with some tolerance for float comparison
+                (v1 - v2).abs() < 1e-5 && (a1 - a2).abs() < 1e-5
+            },
+            _ => false,
+        }
+    }
+}
+
+/// Implement Eq for EmotionalTone
+impl Eq for EmotionalTone {}
 
 /// Represent phrase break or emphasis markers
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,14 +252,15 @@ impl Default for ProsodyGeneratorConfig {
 #[derive(Debug)]
 pub struct ProsodyGenerator {
     config: ProsodyGeneratorConfig,
+    _device: Device,
     emotional_projection: Option<nn::Linear>,
-    phrase_projection: Option<nn::Linear>,
-    emphasis_projection: Option<nn::Linear>,
+    phrasing_projection: Option<nn::Linear>,
+    _emphasis_projection: Option<nn::Linear>,
 }
 
 impl ProsodyGenerator {
     /// Create a new prosody generator
-    pub fn new(config: ProsodyGeneratorConfig, vs_path: &nn::Path) -> Self {
+    pub fn new(config: ProsodyGeneratorConfig, vs_path: &nn::Path) -> Result<Self> {
         // Create projections based on enabled features
         let emotional_projection = if config.enable_emotional_tone {
             Some(nn::linear(
@@ -271,12 +295,13 @@ impl ProsodyGenerator {
             None
         };
         
-        Self {
-            config,
+        Ok(Self {
+            config: config.clone(),
+            _device: config.device,
             emotional_projection,
-            phrase_projection,
-            emphasis_projection,
-        }
+            phrasing_projection: phrase_projection,
+            _emphasis_projection: emphasis_projection,
+        })
     }
     
     /// Generate prosody control from a context embedding
@@ -292,7 +317,7 @@ impl ProsodyGenerator {
         }
         
         // Detect phrase breaks if enabled
-        if let Some(proj) = &self.phrase_projection {
+        if let Some(proj) = &self.phrasing_projection {
             let phrase_breaks = self.detect_phrase_breaks(embedding, proj)?;
             for (pos, strength) in phrase_breaks {
                 control.add_phrase_break(pos, strength);
@@ -303,9 +328,8 @@ impl ProsodyGenerator {
         if self.config.enable_emotional_tone || 
            self.config.enable_phrasing || 
            self.config.enable_emphasis {
-            // For now, this is a placeholder - would need actual tensor generation
             let control_tensor = Tensor::zeros(&[1, self.config.control_dim], 
-                                             (Kind::Float, self.config.device));
+                                             (Kind::Float, self._device));
             control.set_control_tensor(control_tensor);
         }
         
@@ -315,15 +339,15 @@ impl ProsodyGenerator {
         Ok(control)
     }
     
-    /// Detect the emotional tone from a control tensor
-    fn detect_emotional_tone(&self, embedding: &ContextEmbedding, projection: &nn::Linear) -> Result<Option<EmotionalTone>> {
+    /// Attempts to detect the emotional tone from a context embedding
+    pub fn detect_emotional_tone(&self, embedding: &ContextEmbedding, _projection: &nn::Linear) -> Result<Option<EmotionalTone>> {
         // In a real implementation, we would:
         // 1. Use a classifier head to detect the emotional tone from the tensor
         // 2. Or use predefined regions in the embedding space for different tones
         
         // For now, use a simple heuristic based on the first few dimensions
         // This is a placeholder for actual implementation
-        let options = (Kind::Float, self.config.device);
+        let options = (Kind::Float, self._device);
         let _tone_vector = Tensor::zeros(&[7], options);
         
         // Mock classification - extract first 7 values and softmax them
@@ -349,8 +373,8 @@ impl ProsodyGenerator {
         Ok(Some(tone))
     }
     
-    /// Detect phrase break positions from control tensor
-    fn detect_phrase_breaks(&self, embedding: &ContextEmbedding, projection: &nn::Linear) -> Result<Vec<(usize, f32)>> {
+    /// Detects potential phrase breaks in text based on context embedding
+    pub fn detect_phrase_breaks(&self, _embedding: &ContextEmbedding, _projection: &nn::Linear) -> Result<Vec<(usize, f32)>> {
         // In a real implementation, we would use the control tensor to predict break positions
         // For now, return an empty vector as a placeholder
         Ok(Vec::new())

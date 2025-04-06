@@ -1,237 +1,32 @@
 ---
 description: 
 globs: 
-alwaysApply: true
+alwaysApply: false
 ---
-# Audio Processing Standards
+# Audio Processing Rules
 
-## Audio Data Handling
+1. Sample Rates
+   - Be explicit about expected sample rates.
+   - Resample audio data when necessary using appropriate algorithms (e.g., sinc interpolation for quality, linear for speed).
+   - Document the target sample rate for models.
 
-1. **Sample Format**
-   ```rust
-   pub enum SampleFormat {
-       F32,     // 32-bit float (-1.0 to 1.0)
-       I16,     // 16-bit integer
-       I32,     // 32-bit integer
-       U8,      // 8-bit unsigned
-   }
-   ```
+2. Data Formats
+   - Standardize on internal audio representation (e.g., `f32` in [-1.0, 1.0]).
+   - Handle conversions from/to different bit depths (e.g., `i16`) correctly.
+   - Clearly define channel handling (mono vs. stereo).
 
-2. **Buffer Management**
-   ```rust
-   pub struct AudioBuffer<T> {
-       samples: Vec<T>,
-       sample_rate: u32,
-       channels: u16,
-       capacity: usize,
-   }
-   ```
+3. Buffering and Streaming
+   - Use appropriate buffer sizes for streaming audio.
+   - Handle backpressure in streaming pipelines.
+   - Implement strategies for handling partial chunks or finalization.
 
-## Real-time Processing
+4. Normalization
+   - Apply normalization consistently (e.g., peak normalization) if required by models.
 
-1. **Latency Requirements**
-   ```rust
-   pub struct LatencyBounds {
-       max_processing_time: Duration,
-       buffer_size: usize,
-       max_blocking_time: Duration,
-   }
-   ```
+5. Feature Extraction (if applicable)
+   - Document the feature extraction process (e.g., MFCCs, Mel Spectrograms).
+   - Ensure feature extraction parameters are consistent.
 
-2. **Processing Guidelines**
-   - No allocation in hot paths
-   - Use fixed-size buffers
-   - Implement proper threading
-   - Handle buffer underruns
-   - Monitor processing time
-
-## Audio Quality
-
-1. **Quality Metrics**
-   ```rust
-   pub struct AudioQuality {
-       signal_to_noise: f32,
-       total_harmonic_distortion: f32,
-       frequency_response: Vec<f32>,
-       phase_response: Vec<f32>,
-   }
-   ```
-
-2. **Quality Requirements**
-   - Minimize artifacts
-   - Maintain signal integrity
-   - Handle clipping properly
-   - Implement proper dithering
-   - Monitor audio quality
-
-## Stream Management
-
-1. **Stream States**
-   ```rust
-   pub enum StreamState {
-       Initializing,
-       Running,
-       Paused,
-       Stopped,
-       Error(AudioError),
-   }
-   ```
-
-2. **Stream Control**
-   ```rust
-   pub trait StreamControl {
-       fn start(&mut self) -> Result<()>;
-       fn pause(&mut self) -> Result<()>;
-       fn resume(&mut self) -> Result<()>;
-       fn stop(&mut self) -> Result<()>;
-   }
-   ```
-
-## Error Handling
-
-1. **Audio Errors**
-   ```rust
-   pub enum AudioError {
-       BufferUnderrun,
-       BufferOverflow,
-       DeviceError,
-       FormatError,
-       ProcessingError,
-   }
-   ```
-
-2. **Error Recovery**
-   - Handle device failures
-   - Recover from glitches
-   - Implement fallbacks
-   - Log error context
-   - Monitor error rates
-
-## Performance Optimization
-
-1. **Optimization Targets**
-   ```rust
-   pub struct OptimizationMetrics {
-       cpu_usage: f32,
-       memory_usage: usize,
-       latency: Duration,
-       dropout_rate: f32,
-   }
-   ```
-
-2. **Optimization Techniques**
-   - Use SIMD operations
-   - Minimize allocations
-   - Optimize buffer sizes
-   - Use proper threading
-   - Profile hot paths
-
-## Thread Safety
-
-1. **Concurrency Model**
-   ```rust
-   pub trait AudioThread: Send {
-       fn process_audio(&mut self) -> Result<()>;
-       fn handle_error(&mut self, error: AudioError);
-       fn cleanup(&mut self);
-   }
-   ```
-
-2. **Safety Requirements**
-   - Use proper synchronization
-   - Handle thread panics
-   - Implement cleanup
-   - Monitor thread health
-   - Handle cancellation
-
-## Resource Management
-
-1. **Resource Tracking**
-   ```rust
-   pub struct ResourceUsage {
-       memory_allocated: ByteSize,
-       thread_count: usize,
-       device_handles: Vec<DeviceHandle>,
-       open_streams: Vec<StreamHandle>,
-   }
-   ```
-
-2. **Resource Limits**
-   - Set memory bounds
-   - Limit thread count
-   - Monitor device usage
-   - Track handle usage
-   - Implement timeouts
-
-## Testing Requirements
-
-1. **Audio Tests**
-   ```rust
-   pub struct AudioTest {
-       input_signal: Vec<f32>,
-       expected_output: Vec<f32>,
-       tolerance: f32,
-       test_duration: Duration,
-   }
-   ```
-
-2. **Test Coverage**
-   - Test all formats
-   - Test error cases
-   - Test performance
-   - Test thread safety
-   - Test resource cleanup
-
-## Documentation
-
-1. **API Documentation**
-   - Document formats
-   - Explain algorithms
-   - Detail error handling
-   - Specify requirements
-   - Provide examples
-
-2. **Performance Documentation**
-   - Document latency
-   - Specify CPU usage
-   - Detail memory usage
-   - List limitations
-   - Provide benchmarks
-
-## Best Practices
-
-1. **Code Organization**
-   ```rust
-   pub struct AudioModule {
-       processor: AudioProcessor,
-       buffer: AudioBuffer,
-       state: StreamState,
-       config: ProcessingConfig,
-   }
-   ```
-
-2. **Implementation Guidelines**
-   - Use proper abstraction
-   - Implement error handling
-   - Follow RAII pattern
-   - Document unsafe code
-   - Write clear tests
-
-## Monitoring
-
-1. **Metrics**
-   ```rust
-   pub struct AudioMetrics {
-       processing_time: Histogram,
-       buffer_levels: Gauge,
-       error_count: Counter,
-       dropout_rate: Rate,
-   }
-   ```
-
-2. **Monitoring Requirements**
-   - Track latency
-   - Monitor dropouts
-   - Log errors
-   - Track resource usage
-   - Monitor quality
+6. Error Handling
+   - Handle errors during audio loading, processing, and saving gracefully.
+   - Provide informative error messages related to audio issues (e.g., unsupported format, resampling errors). 

@@ -228,6 +228,7 @@ impl RVQEncoder {
         
         // --- Apply Input Projection --- 
         let transposed_weight = self.input_proj_weight.transpose(-2, -1).contiguous();
+        
         let mut projected_x = x.matmul(&transposed_weight);
 
         // Add bias conditionally if it exists
@@ -344,19 +345,19 @@ impl RVQDecoder {
 
 #[allow(dead_code)] // Suppress warning for unused function
 fn normalize_tensor(x: &Tensor) -> Result<Tensor> {
-    let dims = vec![1i64];
-    let norm = x.norm_scalaropt_dim(2, &dims[..], true);
+    let dims: &[i64] = &[0]; // Use slice type hint
+    let norm = x.norm_scalaropt_dim(2, dims, true);
     Ok(x / (norm + 1e-5))
 }
 
-// Flattened version of compute_distances
+// Original, non-parallel version of compute_distances_flat
 fn compute_distances_flat(x_flat: &Tensor, codebook: &Tensor) -> Result<Tensor> {
     // x_flat shape: [M, D] where M = B*T
     // codebook shape: [N, D]
 
     // Calculate norms (squared)
-    let x_norm = x_flat.norm_scalaropt_dim(2.0, &[-1i64], true).pow_tensor_scalar(2.0); // Shape: [M, 1]
-    let cb_norm = codebook.norm_scalaropt_dim(2.0, &[-1i64], true).pow_tensor_scalar(2.0); // Shape: [N, 1]
+    let x_norm = x_flat.norm_scalaropt_dim(2.0, &[-1i64][..], true).pow_tensor_scalar(2.0); // Shape: [M, 1]
+    let cb_norm = codebook.norm_scalaropt_dim(2.0, &[-1i64][..], true).pow_tensor_scalar(2.0); // Shape: [N, 1]
     let cb_norm_t = cb_norm.transpose(-2, -1); // Shape: [1, N]
 
     // Calculate dot product: [M, D] @ [D, N] -> [M, N]

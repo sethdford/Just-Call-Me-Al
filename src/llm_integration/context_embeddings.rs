@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Allow dead code for unused cache methods/structs
+
 //! Context Embedding Generation
 //!
 //! This module handles the generation of fixed-dimension embeddings from

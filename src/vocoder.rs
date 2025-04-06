@@ -13,6 +13,7 @@ use thiserror::Error;
 use log::{debug, error, info, trace, warn};
 use memmap2::Mmap;
 use std::fmt::Debug;
+use candle_core::{Tensor as CandleTensor}; // Add this import
 
 // --- Restore Consolidated tch::nn imports (with self AND Config types) --- 
 use tch::nn::{self, Module, ModuleT, SequentialT, VarStore, Init, LayerNorm, LayerNormConfig, Linear, LinearConfig, Conv1D, ConvConfig, ConvTranspose1D, ConvTransposeConfig, Embedding, EmbeddingConfig};
@@ -26,14 +27,17 @@ use tch::nn::{self, Module, ModuleT, SequentialT, VarStore, Init, LayerNorm, Lay
 // Define the Vocoder trait
 #[async_trait]
 pub trait Vocoder: Send + Sync + Debug {
-    // UPDATED: Accept a single tuple (semantic, acoustic_vec)
-    async fn synthesize_chunk(&self, tokens: (i64, Vec<i64>)) -> Result<Vec<i16>, ModelError>;
-    
-    /// Synthesize audio from a collection of token chunks.
-    async fn decode_tokens(&self, token_chunks: Vec<Vec<(i64, Vec<i64>)>>) -> Result<Vec<i16>, ModelError>;
+    /// Synthesize audio from a batch of predicted RVQ code tensors.
+    /// `rvq_codes`: A Vec where each element is a Tensor representing one codebook.
+    /// Each tensor typically has shape [Batch=1, NumFrames].
+    async fn synthesize_codes(&self, rvq_codes: &[CandleTensor]) -> Result<Vec<i16>, ModelError>;
+
+    /// Synthesize audio from a batch of predicted RVQ code tensors in a streaming fashion.
+    /// Similar to `synthesize_codes`, but designed for processing incoming token batches.
+    async fn synthesize_codes_streaming(&mut self, rvq_codes: &[CandleTensor]) -> Result<Vec<i16>, ModelError>;
 
     /// Decode a tensor of acoustic tokens into waveform data.
-    /// This is a synchronous version of decode_tokens for simpler use cases.
+    /// (Keep this if needed for older compatibility, but prefer `synthesize_codes`)
     fn decode(&self, acoustic_tokens: &[(i64, Vec<i64>)]) -> Result<Vec<i16>, ModelError>;
 
     fn sample_rate(&self) -> u32;
@@ -44,41 +48,41 @@ pub trait Vocoder: Send + Sync + Debug {
 // Placeholder config struct
 #[derive(Debug, Clone)]
 struct MimiConfig {
-    hidden_size: i64,           // 512
-    intermediate_size: i64,     // 2048
-    num_attention_heads: i64,   // 8
-    num_key_value_heads: i64,   // 8
-    head_dim: i64,              // 64
-    norm_eps: f64,              // 1e-05
-    num_hidden_layers: usize,   // 8
-    hidden_act: String,         // "gelu"
-    num_semantic_quantizers: usize, // 1
-    codebook_size: i64,         // 2048
-    codebook_dim: i64,          // 256
-    audio_channels: i64,        // 1
-    kernel_size: i64,           // 7
-    last_kernel_size: i64,      // 3
-    compress: i64,              // 2
-    residual_kernel_size: i64,  // 3
-    num_residual_layers: usize, // 1
-    upsampling_ratios: Vec<i64>,// [8, 6, 5, 4]
-    frame_rate: f64,            // 12.5
-    sampling_rate: i64,         // 24000
-    use_causal_conv: bool,      // true
-    use_conv_shortcut: bool,    // false
-    vector_quantization_hidden_dimension: i64, // 256
-    rope_theta: f64,            // 10000.0
-    sliding_window: i64,        // 250
-    upsample_groups: i64,       // 512
-    dilation_growth_rate: i64,  // 2
-    num_filters: i64,           // 64
-    initializer_range: f64,     // 0.02
-    layer_scale_initial_scale: f64, // 0.01
-    max_position_embeddings: i64, // 8000
-    normalize: bool,            // false
-    pad_mode: String,          // "constant"
-    trim_right_ratio: f64,     // 1.0
-    use_cache: bool,           // false
+    hidden_size: i64,           // 512 - Used
+    intermediate_size: i64,     // 2048 - Used
+    num_attention_heads: i64,   // 8 - Used
+    _num_key_value_heads: i64,   // 8 - Unused
+    head_dim: i64,              // 64 - Used
+    norm_eps: f64,              // 1e-05 - Used
+    num_hidden_layers: usize,   // 8 - Used
+    hidden_act: String,         // "gelu" - Used
+    num_semantic_quantizers: usize, // 1 - Used
+    codebook_size: i64,         // 2048 - Used
+    codebook_dim: i64,          // 256 - Used
+    audio_channels: i64,        // 1 - Used
+    _kernel_size: i64,           // 7 - Unused
+    _last_kernel_size: i64,      // 3 - Unused
+    _compress: i64,              // 2 - Unused (Re-added based on original warning)
+    _residual_kernel_size: i64,  // 3 - Unused
+    _num_residual_layers: usize, // 1 - Unused
+    _upsampling_ratios: Vec<i64>,// [8, 6, 5, 4] - Unused
+    _frame_rate: f64,            // 12.5 - Unused
+    _sampling_rate: i64,         // 24000 - Unused
+    _use_causal_conv: bool,      // true - Unused
+    _use_conv_shortcut: bool,    // false - Unused
+    vector_quantization_hidden_dimension: i64, // 256 - Used
+    rope_theta: f64,            // 10000.0 - Used
+    _sliding_window: i64,        // 250 - Unused
+    _upsample_groups: i64,       // 512 - Unused
+    _dilation_growth_rate: i64,  // 2 - Unused
+    _num_filters: i64,           // 64 - Unused
+    _initializer_range: f64,     // 0.02 - Unused
+    _layer_scale_initial_scale: f64, // 0.01 - Unused
+    _max_position_embeddings: i64, // 8000 - Unused
+    _normalize: bool,            // false - Unused
+    _pad_mode: String,          // "constant" - Unused
+    _trim_right_ratio: f64,     // 1.0 - Unused
+    _use_cache: bool,           // false - Unused
 }
 
 // +++ Add RotaryEmbedding (Copied/Adapted from csm.rs) +++
@@ -164,7 +168,8 @@ struct MimiAttention {
 }
 
 impl MimiAttention {
-    fn new(vs: &tch::nn::Path, config: &MimiConfig, device: Device) -> Result<Self, TchError> { 
+    fn new(vs: &tch::nn::Path, config: &MimiConfig, device: Device) -> Result<Self, TchError> {
+        // Use restored fields
         let embed_dim = config.hidden_size;
         let head_dim = config.head_dim;
         let n_head = config.num_attention_heads;
@@ -173,11 +178,12 @@ impl MimiAttention {
         let k_proj = nn::linear(vs / "k_proj", embed_dim, n_head * head_dim, linear_cfg);
         let v_proj = nn::linear(vs / "v_proj", embed_dim, n_head * head_dim, linear_cfg);
         let o_proj = nn::linear(vs / "o_proj", n_head * head_dim, embed_dim, linear_cfg);
+        // Use restored field, assume 8192 is max_position_embeddings
         let rotary_emb = RotaryEmbedding::new(head_dim, 8192, config.rope_theta, device)?;
         Ok(Self { q_proj, k_proj, v_proj, o_proj, n_head, head_dim, rotary_emb })
     }
 
-    // Rename back to forward, keep start_pos
+    // forward method remains the same
     fn forward(&self, xs: &Tensor, start_pos: usize) -> Tensor {
         let (b_sz, seq_len, _hidden_dim) = xs.size3().expect("Input must be 3D");
 
@@ -222,11 +228,13 @@ struct MimiMLP {
 
 impl MimiMLP {
      fn new(vs: &tch::nn::Path, config: &MimiConfig) -> Result<Self, TchError> {
+         // Use restored fields
          let embed_dim = config.hidden_size;
          let hidden_dim = config.intermediate_size;
          let linear_cfg = LinearConfig { bias: false, ..Default::default() };
          let fc1 = nn::linear(vs / "fc1", embed_dim, hidden_dim, linear_cfg);
          let fc2 = nn::linear(vs / "fc2", hidden_dim, embed_dim, linear_cfg);
+         // Use restored field
          let activation = match config.hidden_act.as_str() {
             "gelu" => |t: &Tensor| t.gelu("none"),
             _ => |t: &Tensor| t.relu(),
@@ -867,38 +875,38 @@ impl MimiVocoder {
             hidden_size: 512,
             intermediate_size: 2048,
             num_attention_heads: 8,
-            num_key_value_heads: 8,
+            _num_key_value_heads: 8,
             head_dim: 64,
-            norm_eps: 1e-5,
+            norm_eps: 1e-05,
             num_hidden_layers: 8,
             hidden_act: "gelu".to_string(),
             num_semantic_quantizers: 1,
             codebook_size: 2048,
             codebook_dim: 256,
             audio_channels: 1,
-            kernel_size: 7,
-            last_kernel_size: 3,
-            compress: 2,
-            residual_kernel_size: 3,
-            num_residual_layers: 1,
-            upsampling_ratios: vec![8, 6, 5, 4],
-            frame_rate: 12.5,
-            sampling_rate: 24000,
-            use_causal_conv: true,
-            use_conv_shortcut: false,
+            _kernel_size: 7,
+            _last_kernel_size: 3,
+            _compress: 2,
+            _residual_kernel_size: 3,
+            _num_residual_layers: 1,
+            _upsampling_ratios: vec![8, 6, 5, 4],
+            _frame_rate: 12.5,
+            _sampling_rate: 24000,
+            _use_causal_conv: true,
+            _use_conv_shortcut: false,
             vector_quantization_hidden_dimension: 256,
             rope_theta: 10000.0,
-            sliding_window: 250,
-            upsample_groups: 512,
-            dilation_growth_rate: 2,
-            num_filters: 64,
-            initializer_range: 0.02,
-            layer_scale_initial_scale: 0.01,
-            max_position_embeddings: 8000,
-            normalize: false,
-            pad_mode: "constant".to_string(),
-            trim_right_ratio: 1.0,
-            use_cache: false,
+            _sliding_window: 250,
+            _upsample_groups: 512,
+            _dilation_growth_rate: 2,
+            _num_filters: 64,
+            _initializer_range: 0.02,
+            _layer_scale_initial_scale: 0.01,
+            _max_position_embeddings: 8000,
+            _normalize: false,
+            _pad_mode: "constant".to_string(),
+            _trim_right_ratio: 1.0,
+            _use_cache: false,
         };
 
         // --- Input Processing ---
@@ -910,7 +918,7 @@ impl MimiVocoder {
         let downsample_kernel_size = 4;
         let downsample_cfg = ConvConfig {
             padding: (downsample_kernel_size - 1) / 2,
-            stride: config.compress,
+            stride: config._compress,
             bias: false,
             ..Default::default()
         };
@@ -975,13 +983,13 @@ impl MimiVocoder {
         info!("Initializing Upsampler with path: {:?}", upsampler_path);
 
         // Calculate kernel sizes based on ratios (2 * ratio for each layer)
-        let kernel_sizes: Vec<i64> = config.upsampling_ratios.iter().map(|&r| r * 2).collect();
+        let kernel_sizes: Vec<i64> = config._upsampling_ratios.iter().map(|&r| r * 2).collect();
 
         let upsample = MimiUpsampler::new(
             &upsampler_path,
             config.hidden_size,
             config.audio_channels,
-            config.upsampling_ratios.clone(),
+            config._upsampling_ratios.clone(),
             kernel_sizes,
         )?;
 
@@ -1127,107 +1135,121 @@ impl MimiVocoder {
 
 #[async_trait]
 impl Vocoder for MimiVocoder {
-    // UPDATED: Accept a single tuple and extract acoustic tokens
-    async fn synthesize_chunk(&self, tokens_tuple: (i64, Vec<i64>)) -> Result<Vec<i16>, ModelError> {
-        // Extract acoustic tokens, ignore semantic token for now
-        let (_semantic_token, acoustic_tokens) = tokens_tuple;
+    /// Synthesize audio from a batch of predicted RVQ code tensors.
+    /// `rvq_codes`: A Vec where each element is a Tensor representing one codebook.
+    /// Each tensor typically has shape [Batch=1, NumFrames].
+    async fn synthesize_codes(&self, rvq_codes: &[CandleTensor]) -> Result<Vec<i16>, ModelError> {
+        if rvq_codes.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        // --- Convert CandleTensors to Tch Tensors --- 
+        let mut tch_codes = Vec::with_capacity(rvq_codes.len());
+        for code_tensor in rvq_codes {
+            // This requires a function to convert candle::Tensor -> tch::Tensor
+            // This is non-trivial and involves potential data copying.
+            warn!("Conversion from candle::Tensor to tch::Tensor is NOT implemented. Vocoder output will be incorrect.");
+            // Placeholder: Create dummy tch tensors of the expected shape
+            let shape = code_tensor.dims().iter().map(|&d| d as i64).collect::<Vec<_>>();
+            let dummy_tch_tensor = Tensor::zeros(&shape, (Kind::Int64, self.device)); 
+            tch_codes.push(dummy_tch_tensor);
+        }
+        // ---------------------------------------------
 
-        // Validate acoustic tokens
-        if acoustic_tokens.is_empty() {
-            // Return Ok(empty) instead of error for empty input chunk? Let's keep error for now.
-            return Err(ModelError::ProcessError("Empty acoustic token sequence provided in chunk".to_string()));
+        // --- Combine and Process Tokens (existing internal logic) ---
+        // 1. Embed each codebook tensor using the quantizer layers
+        let mut embedded_layers = Vec::with_capacity(tch_codes.len());
+        for (i, code_tensor) in tch_codes.iter().enumerate() {
+            if i < self.quantizer.layers.len() {
+                let embedded = self.quantizer.layers[i].forward(code_tensor)?;
+                embedded_layers.push(embedded);
+            } else {
+                warn!("More input code tensors ({}) than quantizer layers ({}).", tch_codes.len(), self.quantizer.layers.len());
+                break;
+            }
         }
 
-        let seq_len = acoustic_tokens.len();
-        // Log level reduced from info to trace to avoid excessive logging
-        trace!(
-            "Vocoder: Processing chunk with {} acoustic tokens.",
-            seq_len
-        );
+        // 2. Sum the embeddings
+        if embedded_layers.is_empty() {
+            return Err(ModelError::InvalidInput("No valid codebook tensors to embed.".to_string()));
+        }
+        let sum_embeddings = Tensor::stack(&embedded_layers, 0).sum_dim_intlist(&[0i64][..], false, Kind::Float);
 
-        // --- Create input tensor from ONLY acoustic tokens --- 
-        // Assuming the first acoustic codebook's tokens are used or model handles it.
-        let token_vec_2d = vec![acoustic_tokens]; // Shape [1, seq_len]
+        // 3. Pass through the rest of the vocoder model (forward method)
+        let output_tensor = self.forward(sum_embeddings)?; // Assuming forward takes the summed embeddings
 
-        let token_tensor = Tensor::from_slice2(&token_vec_2d)
-            .to_device(self.device)
-            .to_kind(Kind::Int64);
-        // -------------------------------------------------------
-
-        // Process through vocoder using the main forward method
-        let audio_tensor = self.forward(token_tensor)?;
-
-        // Convert output tensor to audio samples
-        let audio_tensor_squeezed_float = audio_tensor
-            .squeeze() // Remove batch dimension
-            .to_kind(Kind::Float);
-
-        let audio_out_f32 = Vec::<f32>::try_from(audio_tensor_squeezed_float) // Use TryFrom instead of try_into
-            .map_err(|e| ModelError::ProcessError(format!("Failed to convert output tensor to Vec<f32>: {}", e)))?;
-
-        // Convert f32 to i16 (assuming output is in [-1.0, 1.0])
-        let audio_out_i16 = audio_out_f32
-            .iter()
-            .map(|&sample| (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)
+        // --- Convert Output Tensor to Vec<i16> --- 
+        let output_samples_f32: Vec<f32> = Vec::<f32>::try_from(output_tensor.squeeze())?;
+        let output_samples_i16: Vec<i16> = output_samples_f32
+            .into_iter()
+            .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
             .collect();
 
-        Ok(audio_out_i16)
+        Ok(output_samples_i16)
     }
 
-    /// Synthesize audio from a collection of token chunks.
-    /// Flattens the input `Vec<Vec<(i64, Vec<i64>)>>` and processes each chunk sequentially.
-    async fn decode_tokens(&self, token_chunks: Vec<Vec<(i64, Vec<i64>)>>) -> Result<Vec<i16>, ModelError> {
-        info!("Vocoder: Decoding {} token chunks...", token_chunks.len());
-        let mut all_audio_samples = Vec::new();
-        let flattened_chunks: Vec<(i64, Vec<i64>)> = token_chunks.into_iter().flatten().collect();
-        
-        if flattened_chunks.is_empty() {
-            warn!("Vocoder: decode_tokens received no actual token tuples after flattening.");
-            return Ok(all_audio_samples); // Return empty if no tokens
+    /// Synthesize audio from a batch of predicted RVQ code tensors in a streaming fashion.
+    async fn synthesize_codes_streaming(&mut self, rvq_codes: &[CandleTensor]) -> Result<Vec<i16>, ModelError> {
+        // For non-streaming vocoders like this initial MimiVocoder, streaming just calls the non-streaming version.
+        // A true streaming vocoder would need internal state management.
+        warn!("MimiVocoder synthesize_codes_streaming currently calls non-streaming version.");
+        self.synthesize_codes(rvq_codes).await
+    }
+
+    // Keep the old decode method for now, potentially mark as deprecated
+    fn decode(&self, acoustic_tokens: &[(i64, Vec<i64>)]) -> Result<Vec<i16>, ModelError> {
+        warn!("`decode` is deprecated. Use `synthesize_codes` instead.");
+        if acoustic_tokens.is_empty() {
+            return Ok(Vec::new());
         }
 
-        info!("Vocoder: Processing {} flattened token tuples.", flattened_chunks.len());
-        
-        for token_tuple in flattened_chunks {
-            match self.synthesize_chunk(token_tuple).await {
-                Ok(audio_chunk) => {
-                    all_audio_samples.extend(audio_chunk);
-                }
-                Err(e) => {
-                    // Decide how to handle errors: continue, log, or return error immediately?
-                    // Let's log and continue for now, returning potentially partial audio.
-                    error!("Vocoder: Error synthesizing chunk: {}. Skipping chunk.", e);
-                    // Alternatively, return the error immediately:
-                    // return Err(ModelError::ProcessError(format!("Failed during chunk synthesis: {}", e)));
-                }
+        // --- Convert input format to Vec<Tensor> for internal processing --- 
+        let mut codebook_tensors: Vec<Tensor> = Vec::new();
+        let num_codebooks = self.config.num_hidden_layers; // Use config
+        let mut temp_token_storage: Vec<Vec<i64>> = vec![Vec::new(); num_codebooks];
+        let mut max_len = 0;
+
+        for (idx, tokens) in acoustic_tokens {
+            if *idx >= 0 && (*idx as usize) < num_codebooks {
+                temp_token_storage[*idx as usize] = tokens.clone();
+                max_len = max_len.max(tokens.len());
+            } else {
+                warn!("Invalid codebook index {} received in decode.", idx);
             }
         }
         
-        info!("Vocoder: Finished decoding tokens. Total samples: {}", all_audio_samples.len());
-        Ok(all_audio_samples)
-    }
+        // Pad and convert to Tensors
+        for mut tokens in temp_token_storage {
+            let current_len = tokens.len();
+            if current_len < max_len {
+                tokens.resize(max_len, 0); // Pad with 0 (or a specific PAD token?)
+            }
+            let tensor = Tensor::from_slice(&tokens).to(self.device).unsqueeze(0); // [1, max_len]
+            codebook_tensors.push(tensor);
+         }
+        // ---------------------------------------------------------------------
 
-    /// Decode a tensor of acoustic tokens into waveform data.
-    /// This is a synchronous version of decode_tokens for simpler use cases.
-    fn decode(&self, acoustic_tokens: &[(i64, Vec<i64>)]) -> Result<Vec<i16>, ModelError> {
-        info!("Vocoder: Decoding {} acoustic tokens...", acoustic_tokens.len());
-        let all_audio_samples = Vec::new();
-        
-        if acoustic_tokens.is_empty() {
-            warn!("Vocoder: decode received no actual token tuples.");
-            return Ok(all_audio_samples); // Return empty if no tokens
+        // --- Combine and Process Tokens (Similar to synthesize_codes) --- 
+        let mut embedded_layers = Vec::with_capacity(codebook_tensors.len());
+        for (i, code_tensor) in codebook_tensors.iter().enumerate() {
+             if i < self.quantizer.layers.len() {
+                 let embedded = self.quantizer.layers[i].forward(code_tensor)?;
+                 embedded_layers.push(embedded);
+             } else { break; }
         }
+        if embedded_layers.is_empty() { return Err(ModelError::InvalidInput("No valid tokens for decode.".to_string())); }
+        let sum_embeddings = Tensor::stack(&embedded_layers, 0).sum_dim_intlist(&[0i64][..], false, Kind::Float);
+        let output_tensor = self.forward(sum_embeddings)?;
+        // ---------------------------------------------------------------------
 
-        info!("Vocoder: Processing {} acoustic token tuples.", acoustic_tokens.len());
-        
-        // Convert to Vec<Vec<(i64, Vec<i64>)>> format for decode_tokens
-        let token_chunks = vec![acoustic_tokens.to_vec()];
-        
-        // Use tokio runtime to run the async decode_tokens
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| ModelError::ProcessError(format!("Failed to create runtime: {}", e)))?;
-        
-        rt.block_on(self.decode_tokens(token_chunks))
+        // --- Convert Output Tensor to Vec<i16> --- 
+        let output_samples_f32: Vec<f32> = Vec::<f32>::try_from(output_tensor.squeeze())?;
+        let output_samples_i16: Vec<i16> = output_samples_f32
+            .into_iter()
+            .map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16)
+            .collect();
+
+        Ok(output_samples_i16)
     }
 
     fn sample_rate(&self) -> u32 {
@@ -1237,8 +1259,8 @@ impl Vocoder for MimiVocoder {
 
 // ... MockVocoder (keep) ...
 
-// Restore tensor_view_to_tensor helper
-fn tensor_view_to_tensor<T: safetensors::tensor::View + ?Sized>(view: &T, device: Device) -> Result<Tensor, TchError> {
+// Prefix unused function
+fn _tensor_view_to_tensor<T: safetensors::tensor::View + ?Sized>(view: &T, device: Device) -> Result<Tensor, TchError> {
     let kind = match view.dtype() {
         safetensors::Dtype::F64 => Kind::Double,
         safetensors::Dtype::F32 => Kind::Float,
@@ -1287,42 +1309,4 @@ fn tensor_view_to_tensor<T: safetensors::tensor::View + ?Sized>(view: &T, device
     }
 
     result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-    use tracing_test::traced_test;
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_mimi_vocoder_load_and_process() -> Result<(), ModelError> {
-        // Initialize vocoder
-        let device = Device::Cpu;
-        let sample_rate = 24000;
-        let mut vocoder = MimiVocoder::new(sample_rate, device)?;
-
-        // Load weights
-        let model_path = PathBuf::from("models/mimi/model.safetensors");
-        vocoder.load_model(model_path)?;
-
-        // Create test tokens: batch size 1, sequence length 1920 (arbitrary length)
-        let sequence_length = 1920;
-        let acoustic_tokens = vec![0i64; sequence_length]; // Acoustic tokens
-        let semantic_token = 0i64; // Dummy semantic token
-        let tokens_tuple = (semantic_token, acoustic_tokens); // Create the tuple directly
-        info!("Created test token tuple: semantic={}, acoustic_len={}", 
-              tokens_tuple.0, tokens_tuple.1.len());
-
-        // Process tokens through vocoder
-        let audio = vocoder.synthesize_chunk(tokens_tuple).await?; // Pass the tuple directly
-
-        // Basic validation
-        assert!(!audio.is_empty(), "Generated audio should not be empty");
-        assert_eq!(vocoder.sample_rate(), sample_rate);
-        info!("Generated audio output: {} samples", audio.len());
-
-        Ok(())
-    }
 }

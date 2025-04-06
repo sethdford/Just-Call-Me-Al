@@ -3,132 +3,46 @@ description:
 globs: 
 alwaysApply: true
 ---
- # Async Rust Guidelines
+# Rust Async Programming Standards
 
-## Tokio Runtime
+1. Tokio Usage
+- Use tokio as the primary async runtime
+- Properly handle task spawning and cancellation
+- Use appropriate executor configurations
+- Implement graceful shutdown patterns
 
-- **Runtime Selection**
-  - Use multi-thread runtime for CPU-bound tasks
-  - Use current-thread runtime for IO-bound tasks
-  ```rust
-  // ✅ DO: Choose appropriate runtime
-  #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-  async fn main() {
-      // CPU-intensive tasks
-  }
+2. Error Handling
+- Use anyhow/thiserror for async error types
+- Properly propagate errors across async boundaries
+- Handle timeout and cancellation errors
+- Provide context for async errors
 
-  #[tokio::main(flavor = "current_thread")]
-  async fn main() {
-      // IO-bound tasks
-  }
-  ```
+3. Stream Processing
+- Use Stream trait for async sequences
+- Implement backpressure mechanisms
+- Handle stream errors appropriately
+- Use appropriate buffer sizes
 
-## Task Management
+4. Resource Management
+- Clean up resources in drop implementations
+- Use Arc/Mutex for shared state
+- Implement proper timeout handling
+- Use connection pooling where appropriate
 
-- **Spawning Tasks**
-  - Use `tokio::spawn` for concurrent tasks
-  - Handle task results properly
-  - Use `JoinSet` for managing multiple tasks
-  ```rust
-  // ✅ DO: Proper task management
-  let mut set = JoinSet::new();
-  
-  for task in tasks {
-      set.spawn(async move {
-          process_task(task).await
-      });
-  }
-  
-  while let Some(result) = set.join_next().await {
-      match result {
-          Ok(Ok(_)) => println!("Task completed"),
-          Ok(Err(e)) => eprintln!("Task error: {}", e),
-          Err(e) => eprintln!("Join error: {}", e),
-      }
-  }
-  ```
+5. Testing
+- Use tokio test macros
+- Test async timeouts and cancellation
+- Mock async dependencies when needed
+- Test concurrent access patterns
 
-## Channel Patterns
+6. Performance
+- Use appropriate channel types (mpsc, oneshot, broadcast)
+- Avoid blocking operations in async contexts
+- Use spawn_blocking for CPU-intensive tasks
+- Monitor and tune task scheduling
 
-- **Channel Selection**
-  - Use `mpsc` for multiple producers, single consumer
-  - Use `broadcast` for multiple producers, multiple consumers
-  - Use `watch` for single producer, multiple consumers
-  - Use `oneshot` for single-use channels
-  ```rust
-  // ✅ DO: Use appropriate channels
-  let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-  let (tx, rx) = tokio::sync::broadcast::channel(16);
-  let (tx, rx) = tokio::sync::watch::channel(initial_value);
-  let (tx, rx) = tokio::sync::oneshot::channel();
-  ```
-
-## Resource Management
-
-- **Connection Pooling**
-  - Use connection pools for databases
-  - Implement proper cleanup
-  - Handle errors gracefully
-  ```rust
-  // ✅ DO: Proper resource management
-  let pool = Pool::builder()
-      .max_size(15)
-      .build(manager)
-      .await?;
-
-  let conn = pool.get().await?;
-  ```
-
-## Error Handling
-
-- **Async-Aware Errors**
-  - Use async-aware error types
-  - Handle timeouts properly
-  - Convert between error types
-  ```rust
-  // ✅ DO: Handle async errors
-  #[derive(Debug, thiserror::Error)]
-  enum AsyncError {
-      #[error("Operation timed out")]
-      Timeout(#[from] tokio::time::error::Elapsed),
-      #[error("IO error: {0}")]
-      Io(#[from] std::io::Error),
-  }
-  ```
-
-## Testing
-
-- **Async Tests**
-  - Use `#[tokio::test]`
-  - Test timeouts
-  - Mock time when needed
-  ```rust
-  // ✅ DO: Proper async testing
-  #[tokio::test]
-  async fn test_with_timeout() {
-      tokio::time::timeout(
-          Duration::from_secs(1),
-          async_operation()
-      ).await?;
-  }
-  ```
-
-## Performance Patterns
-
-- **Batching Operations**
-  - Batch similar operations
-  - Use semaphores for concurrency control
-  - Implement rate limiting
-  ```rust
-  // ✅ DO: Batch operations
-  let semaphore = Arc::new(Semaphore::new(10));
-  let mut handles = vec![];
-  
-  for item in items {
-      let permit = semaphore.clone().acquire_owned().await?;
-      handles.push(tokio::spawn(async move {
-          let _permit = permit;
-          process_item(item).await
-      }));
-  }
-  ```
+7. Safety
+- Handle all Future cancellation cases
+- Properly synchronize shared state
+- Use async traits with Send/Sync bounds
+- Validate all async lifecycle events 

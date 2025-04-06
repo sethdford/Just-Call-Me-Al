@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Allow dead code for unused template methods
+
 //! Prompt Template Management
 //!
 //! This module defines templates for different LLM prompting scenarios,

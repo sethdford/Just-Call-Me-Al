@@ -1,0 +1,28 @@
+[logging]
+level = "info"
+
+[model]
+# Common settings
+model_type = "csm"  # Options: "csm" or "moshi"
+device_type = "cpu" # Options: "cpu", "cuda", or "mps"
+
+# CSM model settings (used when model_type = "csm")
+model_dir = "csm-1b"
+experimental = false
+temperature = 0.7
+top_k = 50
+
+# Moshi model settings (used when model_type = "moshi")
+moshi_model_path = "moshi/language_model.safetensors"
+tokenizer_path = "moshi/tokenizer.model"
+mimi_model_path = "mimi/model.safetensors"
+
+[audio]
+sample_rate = 24000
+channels = 1
+bit_depth = 16
+
+[server]
+enabled = true
+port = 8000
+static_dir = "static" 

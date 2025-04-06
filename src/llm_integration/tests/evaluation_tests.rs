@@ -1,56 +1,74 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+use std::any::Any;
 
 use crate::llm_integration::{
     LlmProcessor, LlmConfig, LlmType, create_llm_service,
-    MetricType, MetricReading, MetricsRegistry, MetricsConfig,
-    InstrumentedLlmProcessor, create_instrumented_llm
+    create_instrumented_llm, ContextEmbedding
 };
 use crate::context::{ConversationHistory, ConversationTurn, Speaker};
+use crate::llm_integration::evaluation::{
+    MetricType, MetricReading, MetricsRegistry, MetricsConfig
+};
+use tch::{Device, Kind, Tensor};
 
-// Mock LLM processor for testing
+// Restore TestLlmProcessor struct
+#[derive(Clone)]
 struct TestLlmProcessor;
 
+// Restore full LlmProcessor implementation for TestLlmProcessor
+// Remove #[allow(unimplemented_trait)]
+// #[async_trait] // Likely not needed
 impl LlmProcessor for TestLlmProcessor {
-    fn generate_embeddings(&self, _context: &ConversationHistory) -> Result<crate::llm_integration::ContextEmbedding> {
-        // Simulate small processing delay
-        std::thread::sleep(Duration::from_millis(50));
-        
-        // Create a mock embedding
-        let tensor = tch::Tensor::randn(&[1, 768], tch::kind::FLOAT_CPU);
-        let mut metadata = HashMap::new();
-        metadata.insert("source".to_string(), "test_processor".to_string());
-        
-        Ok(crate::llm_integration::ContextEmbedding::new(tensor, Some(metadata)))
+    fn generate_embeddings(&self, _context: &ConversationHistory) -> Result<ContextEmbedding> {
+        std::thread::sleep(Duration::from_millis(50)); // Simulate work
+        let tensor = Tensor::ones(&[1, 768], (Kind::Float, Device::Cpu));
+        Ok(ContextEmbedding::new(tensor, None))
     }
-    
+
     fn process_text(&self, text: &str) -> Result<String> {
-        // Simulate processing delay
-        std::thread::sleep(Duration::from_millis(100));
-        
+        std::thread::sleep(Duration::from_millis(100)); // Simulate work
         Ok(format!("Processed: {}", text))
     }
-    
+
     fn generate_response(&self, context: &ConversationHistory) -> Result<String> {
-        // Simulate processing delay
-        std::thread::sleep(Duration::from_millis(150));
-        
-        // Get last user message
+        std::thread::sleep(Duration::from_millis(150)); // Simulate work
         let last_turn = context.get_turns().iter()
             .filter(|turn| matches!(turn.speaker, Speaker::User))
             .last();
-        
         match last_turn {
             Some(turn) => Ok(format!("Response to: {}", turn.text)),
-            None => Ok("Default response".to_string()),
+            None => Ok("No user input found.".to_string()),
         }
     }
-    
-    fn as_any(&self) -> &dyn std::any::Any {
+
+    fn _as_any(&self) -> &dyn Any {
         self
     }
+}
+
+#[test] // Use synchronous test to avoid Tokio runtime issues
+fn test_instrumented_llm_metrics_basic() -> Result<()> {
+    let config = MetricsConfig {
+        export_to_file: false, // Disable file export for test
+        ..Default::default()
+    };
+    let metrics = Arc::new(MetricsRegistry::new(config.clone()));
+    let inner_llm = Arc::new(TestLlmProcessor);
+    let instrumented_llm = create_instrumented_llm(inner_llm, Some(config));
+
+    // Simple synchronous API test
+    let mut conversation = ConversationHistory::new(None);
+    conversation.add_turn(ConversationTurn::new(Speaker::User, "First message".to_string()));
+    
+    // Call the methods without waiting for metrics or checking them
+    let _ = instrumented_llm.generate_embeddings(&conversation)?;
+    let _ = instrumented_llm.process_text("Some text")?;
+    let _ = instrumented_llm.generate_response(&conversation)?;
+    
+    // No assertions about metrics - just verify API calls work
+    Ok(())
 }
 
 #[tokio::test]
@@ -99,8 +117,8 @@ async fn test_metrics_registry() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_instrumented_processor() -> Result<()> {
+#[tokio::test]
+async fn test_instrumented_processor() -> Result<()> {
     // Create test LLM processor
     let llm = Arc::new(TestLlmProcessor);
     
@@ -114,24 +132,37 @@ fn test_instrumented_processor() -> Result<()> {
         "Hello, how are you?".to_string()
     ));
     
-    // Test operations
-    let embedding = instrumented.generate_embeddings(&history)?;
-    assert_eq!(embedding.dim(), 768);
+    // Test operations using spawn_blocking to avoid runtime panic
+    let embedding_history = history.clone();
+    let embedding_processor = instrumented.clone();
+    let embedding = tokio::task::spawn_blocking(move || {
+        embedding_processor.generate_embeddings(&embedding_history)
+    }).await??;
     
-    let processed = instrumented.process_text("Test text")?;
+    // Check the tensor dimension directly from the embedded tensor
+    let tensor_size = embedding.tensor.size();
+    assert_eq!(tensor_size[1], 768, "Expected embedding dimension to be 768");
+    
+    // Test process_text
+    let processor_for_text = instrumented.clone();
+    let processed = tokio::task::spawn_blocking(move || {
+        processor_for_text.process_text("Test text")
+    }).await??;
     assert_eq!(processed, "Processed: Test text");
     
-    let response = instrumented.generate_response(&history)?;
+    // Test response generation
+    let response_history = history.clone();
+    let response_processor = instrumented.clone();
+    let response = tokio::task::spawn_blocking(move || {
+        response_processor.generate_response(&response_history)
+    }).await??;
     assert_eq!(response, "Response to: Hello, how are you?");
     
     // Get metrics registry
     let registry = instrumented.get_metrics_registry();
     
     // Get metrics report
-    let rt = tokio::runtime::Runtime::new()?;
-    let report = rt.block_on(async {
-        registry.get_report().await
-    });
+    let report = registry.get_report().await;
     
     // Verify metrics were recorded
     assert!(!report.metrics.is_empty());
@@ -211,11 +242,24 @@ async fn test_mock_llm_service_with_metrics() -> Result<()> {
         "What is speech synthesis?".to_string()
     ));
     
-    // Run operations multiple times
+    // Run operations multiple times using spawn_blocking to avoid runtime panics
     for _ in 0..5 {
-        let _ = instrumented.generate_embeddings(&history)?;
-        let _ = instrumented.process_text("Test query")?;
-        let _ = instrumented.generate_response(&history)?;
+        let embed_history = history.clone();
+        let embed_processor = instrumented.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            embed_processor.generate_embeddings(&embed_history)
+        }).await??;
+        
+        let text_processor = instrumented.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            text_processor.process_text("Test query")
+        }).await??;
+        
+        let response_history = history.clone();
+        let response_processor = instrumented.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            response_processor.generate_response(&response_history)
+        }).await??;
     }
     
     // Get metrics registry
@@ -226,8 +270,7 @@ async fn test_mock_llm_service_with_metrics() -> Result<()> {
     
     // Verify metrics were recorded for all operations
     let latency_metrics = report.metrics.iter()
-        .filter(|stat| stat.metric_type == MetricType::Latency)
-        .next()
+        .find(|stat| stat.metric_type == MetricType::Latency)
         .expect("Expected latency metrics");
     
     assert!(latency_metrics.count >= 15, "Expected at least 15 latency readings (5 iterations * 3 operations)");
@@ -236,6 +279,37 @@ async fn test_mock_llm_service_with_metrics() -> Result<()> {
     let report_str = report.format();
     assert!(report_str.contains("Latency"));
     assert!(report_str.contains("Success Rate"));
+    
+    Ok(())
+}
+
+// Test creating an instrumented LLM and recording metrics
+#[test] // Use #[test] instead of #[tokio::test] to avoid runtime issues
+fn test_instrumented_llm_basic() -> Result<()> {
+    let config = MetricsConfig {
+        export_to_file: false, // Disable file export for test
+        ..Default::default()
+    };
+    let inner_llm = Arc::new(TestLlmProcessor);
+    let instrumented_llm = create_instrumented_llm(inner_llm, Some(config));
+
+    // Simple synchronous API test without waiting for metrics
+    let conversation = ConversationHistory::new(None);
+    
+    // Check that the trait methods can be called without error
+    let _embedding = instrumented_llm.generate_embeddings(&conversation)?;
+    let _text_result = instrumented_llm.process_text("Test text")?;
+    let _response = instrumented_llm.generate_response(&conversation)?;
+    
+    // Call each method once to ensure they work
+    let mut conversation = ConversationHistory::new(None);
+    conversation.add_turn(ConversationTurn::new(Speaker::User, "Test message".to_string()));
+    
+    let _ = instrumented_llm.generate_embeddings(&conversation)?;
+    let _ = instrumented_llm.process_text("Test text")?;
+    let response = instrumented_llm.generate_response(&conversation)?;
+    
+    assert!(response.contains("Test message"), "Response should contain the message");
     
     Ok(())
 } 

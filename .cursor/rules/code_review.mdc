@@ -3,223 +3,36 @@ description:
 globs: 
 alwaysApply: true
 ---
-# Code Review Standards
+# Code Review Guidelines
 
-## Review Checklist
+1. Purpose
+   - Improve code quality, correctness, and maintainability.
+   - Share knowledge and ensure consistency.
+   - Catch potential bugs and design flaws early.
 
-1. **Audio Processing**
-   - Check for proper sample rate handling
-   - Verify buffer management
-   - Validate audio format conversions
-   - Check for potential audio glitches
-   - Verify real-time processing constraints
+2. Focus Areas
+   - **Correctness:** Does the code do what it's intended to do? Does it handle edge cases?
+   - **Readability:** Is the code clear, well-formatted, and easy to understand?
+   - **Design:** Does the code follow established architectural patterns? Is it modular and extensible?
+   - **Performance:** Are there obvious performance bottlenecks? Is resource usage efficient?
+   - **Testing:** Are there sufficient tests? Do tests cover relevant scenarios?
+   - **Documentation:** Is the code adequately documented? Is the documentation accurate?
+   - **Safety:** Does the code adhere to Rust's safety principles? Is `unsafe` used appropriately?
 
-2. **Memory Safety**
-   - Review unsafe blocks
-   - Check mutex usage
-   - Verify resource cleanup
-   - Check for memory leaks
-   - Validate lifetime annotations
+3. Process
+   - Keep Pull Requests (PRs) small and focused.
+   - Provide clear descriptions and context for PRs.
+   - Respond to review comments promptly.
+   - Be constructive and respectful in reviews.
+   - Aim for consensus, but the original author has the final say unless there are major issues.
 
-3. **Error Handling**
-   - Proper error propagation
-   - Meaningful error messages
-   - Recovery mechanisms
-   - Logging implementation
-   - Error type definitions
+4. Reviewer Responsibilities
+   - Understand the context and goals of the changes.
+   - Provide specific, actionable feedback.
+   - Suggest improvements, not just point out flaws.
+   - Verify that tests pass and cover the changes.
 
-4. **Performance**
-   - Check for unnecessary allocations
-   - Review async implementation
-   - Verify buffer sizes
-   - Check for blocking operations
-   - Profile critical paths
-
-## Code Quality Metrics
-
-```rust
-pub struct CodeQualityMetrics {
-    complexity: ComplexityScore,
-    test_coverage: Coverage,
-    documentation: DocCoverage,
-    performance: PerfMetrics,
-    safety_score: SafetyScore,
-}
-```
-
-## Review Process
-
-1. **Pre-review Checklist**
-   ```rust
-   pub struct PreReviewChecks {
-       tests_passing: bool,
-       clippy_clean: bool,
-       formatting_correct: bool,
-       docs_updated: bool,
-       benchmarks_run: bool,
-   }
-   ```
-
-2. **Review Stages**
-   ```rust
-   pub enum ReviewStage {
-       AutomatedChecks,
-       CodeQualityReview,
-       FunctionalReview,
-       PerformanceReview,
-       SecurityReview,
-       FinalApproval,
-   }
-   ```
-
-## Documentation Review
-
-1. **Required Documentation**
-   - Public API documentation
-   - Complex algorithm explanations
-   - Performance characteristics
-   - Safety requirements
-   - Usage examples
-
-2. **Documentation Quality**
-   ```rust
-   pub struct DocQuality {
-       completeness: Percentage,
-       clarity: Score,
-       examples: bool,
-       up_to_date: bool,
-   }
-   ```
-
-## Testing Review
-
-1. **Test Coverage**
-   ```rust
-   pub struct TestCoverage {
-       unit_tests: Coverage,
-       integration_tests: Coverage,
-       property_tests: Coverage,
-       performance_tests: Coverage,
-   }
-   ```
-
-2. **Test Quality**
-   - Edge case coverage
-   - Error case testing
-   - Async behavior testing
-   - Resource cleanup testing
-   - Performance benchmarks
-
-## Performance Review
-
-1. **Performance Criteria**
-   ```rust
-   pub struct PerfCriteria {
-       latency_threshold: Duration,
-       memory_limit: ByteSize,
-       cpu_usage_limit: Percentage,
-       throughput_minimum: Throughput,
-   }
-   ```
-
-2. **Benchmark Requirements**
-   - Audio processing speed
-   - Memory consumption patterns
-   - CPU utilization
-   - I/O performance
-   - Concurrency behavior
-
-## Security Review
-
-1. **Security Checklist**
-   ```rust
-   pub struct SecurityChecks {
-       input_validation: bool,
-       error_handling: bool,
-       resource_limits: bool,
-       access_control: bool,
-       data_protection: bool,
-   }
-   ```
-
-2. **Security Considerations**
-   - Buffer overflow prevention
-   - Resource exhaustion protection
-   - Proper error handling
-   - Access control implementation
-   - Data validation
-
-## Best Practices Review
-
-1. **Code Style**
-   - Rust idioms usage
-   - Naming conventions
-   - Module organization
-   - Type safety
-   - Error handling patterns
-
-2. **Architecture**
-   - Component separation
-   - Interface design
-   - Error handling strategy
-   - Resource management
-   - Concurrency patterns
-
-## Review Comments
-
-1. **Comment Categories**
-   ```rust
-   pub enum CommentType {
-       Bug,              // Potential bugs
-       Performance,      // Performance issues
-       Style,           // Code style issues
-       Security,        // Security concerns
-       Documentation,   // Documentation needs
-       Testing,         // Testing requirements
-   }
-   ```
-
-2. **Comment Guidelines**
-   - Be specific and actionable
-   - Reference relevant documentation
-   - Suggest improvements
-   - Provide examples
-   - Explain reasoning
-
-## Review Automation
-
-1. **Automated Checks**
-   ```rust
-   pub struct AutomatedReview {
-       clippy_checks: Vec<ClippyLint>,
-       security_checks: Vec<SecurityScan>,
-       performance_checks: Vec<PerfCheck>,
-       documentation_checks: Vec<DocCheck>,
-   }
-   ```
-
-2. **Integration Tests**
-   - Run full test suite
-   - Run benchmarks
-   - Check documentation coverage
-   - Verify formatting
-   - Run security scans
-
-## Review Completion
-
-1. **Approval Requirements**
-   ```rust
-   pub struct ApprovalRequirements {
-       required_approvers: u32,
-       blocking_issues_resolved: bool,
-       tests_passing: bool,
-       performance_verified: bool,
-   }
-   ```
-
-2. **Post-merge Checks**
-   - Verify integration tests
-   - Check performance impact
-   - Monitor error rates
-   - Track technical debt
-   - Update documentation
+5. Author Responsibilities
+   - Explain the changes clearly in the PR description.
+   - Address all review comments, either by making changes or explaining why not.
+   - Ensure the PR is merge-ready (passes CI, tests, etc.). 

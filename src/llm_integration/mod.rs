@@ -12,15 +12,13 @@ mod context_embeddings;
 mod llm_service;
 mod prompt_templates;
 mod optimization;
-mod evaluation;
+pub mod evaluation;
 
 // Re-exports
-pub use context_embeddings::{ContextEmbedding, ContextEmbeddingConfig, ContextEmbeddingGenerator, CacheStats};
-pub use prompt_templates::{PromptTemplate, PromptTemplateRegistry, PromptType};
-pub use optimization::{OptimizedLlm, OptimizedInference, TimingStats, ComputationCache, create_optimized_llm, optimized_tensor_op};
+pub use context_embeddings::ContextEmbedding;
+pub use optimization::{OptimizedLlm, create_optimized_llm};
 pub use evaluation::{
-    MetricType, MetricReading, MetricsRegistry, MetricsConfig, MetricsReport,
-    MetricStatistics, InstrumentedLlmProcessor, BenchmarkResults, LlmBenchmark,
+    MetricsConfig,
     create_instrumented_llm
 };
 
@@ -35,12 +33,12 @@ pub trait LlmProcessor: Send + Sync {
     /// Generate a response based on conversation history
     fn generate_response(&self, context: &crate::context::ConversationHistory) -> Result<String>;
     
-    /// Convert to Any for downcasting
-    fn as_any(&self) -> &dyn Any;
+    /// Return self as Any to allow downcasting
+    fn _as_any(&self) -> &dyn Any;
 }
 
 // Export the trait and necessary concrete types/configs
-pub use llm_service::{LlmConfig, LlmType, create_service, MockLlmService, LlamaService, MistralService, LocalModelService};
+pub use llm_service::{LlmConfig, LlmType};
 
 // Export test module if needed for external tests
 #[cfg(test)]
@@ -57,10 +55,12 @@ pub fn create_optimized_llm_service(config: LlmConfig) -> Result<Arc<OptimizedLl
     Ok(create_optimized_llm(llm))
 }
 
-/// Factory function to create an instrumented LLM service with monitoring
-pub fn create_monitored_llm_service(config: LlmConfig, metrics_config: Option<MetricsConfig>) -> Result<Arc<InstrumentedLlmProcessor>> {
-    let llm = create_llm_service(config)?;
-    Ok(create_instrumented_llm(llm, metrics_config))
+/// Creates an LLM service, potentially wrapped with monitoring capabilities
+/// This function handles the logic of choosing the correct LLM implementation and wrapping it
+pub fn _create_monitored_llm_service(config: LlmConfig, metrics_config: Option<MetricsConfig>) -> Result<Arc<dyn LlmProcessor>> {
+    // Create the base LLM service
+    let base_llm = create_llm_service(config)?;
+    Ok(create_instrumented_llm(base_llm, metrics_config))
 }
 
 /// Convert from context::ConversationHistory to our local ConversationHistory
@@ -69,11 +69,8 @@ pub fn create_llm_history(local_history: &crate::context::ConversationHistory) -
     
     // Copy each turn using the public get_turns() method
     for turn in local_history.get_turns() {
-        let speaker = match turn.speaker {
-            crate::context::Speaker::User => crate::context::Speaker::User,
-            crate::context::Speaker::Model => crate::context::Speaker::Model,
-            crate::context::Speaker::System => crate::context::Speaker::System,
-        };
+        // Clone speaker since it doesn't implement Copy
+        let speaker = map_speaker(turn.speaker.clone());
         
         llm_history.add_turn(crate::context::ConversationTurn::new(
             speaker,
@@ -82,4 +79,12 @@ pub fn create_llm_history(local_history: &crate::context::ConversationHistory) -
     }
     
     llm_history
+}
+
+fn map_speaker(speaker: crate::context::Speaker) -> crate::context::Speaker {
+    match speaker {
+        crate::context::Speaker::User => crate::context::Speaker::User,
+        crate::context::Speaker::Assistant => crate::context::Speaker::Assistant,
+        crate::context::Speaker::_System => crate::context::Speaker::_System,
+    }
 } 

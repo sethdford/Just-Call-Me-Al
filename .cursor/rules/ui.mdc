@@ -1,3 +1,8 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
 # UI/UX Guidelines (Placeholder)
 
 *Note: These are general placeholders. Specific UI guidelines depend heavily on the chosen framework and design system.*

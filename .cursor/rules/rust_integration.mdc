@@ -1,0 +1,151 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+ \
+# Rust Integration Guidelines
+
+## Dependency Management
+
+1. **Avoid Feature Flags for Core Functionality**
+   - Core functionality should be directly integrated without feature flags
+   - Prefer clear, explicit dependencies over conditional compilation
+   - Use conditional compilation only for platform-specific code (not for enabling/disabling features)
+   ```rust
+   // ❌ AVOID: Conditional module inclusion via features
+   #[cfg(feature = "enable_tch")]
+   pub mod tch_module;
+   
+   // ✅ PREFER: Direct, unconditional integration
+   pub mod tch_module;
+   ```
+
+2. **Dependency Version Management**
+   - Pin explicit versions for all dependencies to ensure reproducible builds
+   - Document version compatibility requirements in comments
+   - Use the workspace resolver to handle dependency conflicts
+   ```toml
+   # ✅ DO: Pin explicit versions
+   tch = "0.19.0"
+   candle-core = "0.8.3"
+   
+   # ✅ DO: Use workspace resolver
+   [workspace]
+   resolver = "2"
+   ```
+
+3. **Handling External Libraries**
+   - Wrap external libraries in adapter modules for better maintainability
+   - Provide clear error mapping between external and internal errors
+   - Create abstraction layers to simplify switching implementations
+   ```rust
+   // External library adapter example
+   pub struct TchModelAdapter {
+       inner: tch::CModule,
+   }
+   
+   impl TchModelAdapter {
+       pub fn new(path: &Path) -> Result<Self> {
+           let inner = tch::CModule::load(path)
+               .map_err(|e| ModelError::LoadError(format!("Failed to load model: {}", e)))?;
+           Ok(Self { inner })
+       }
+   }
+   ```
+
+## Integration Strategy
+
+1. **Backend Integration**
+   - Support multiple backend libraries (tch, candle) without feature flags
+   - Use runtime configuration to select the appropriate backend
+   - Provide clear, documented APIs for each backend
+   ```rust
+   pub enum BackendType {
+       Tch,
+       Candle,
+   }
+   
+   pub fn create_model(
+       backend: BackendType, 
+       path: &Path
+   ) -> Result<Arc<dyn Model>> {
+       match backend {
+           BackendType::Tch => Ok(Arc::new(TchModel::new(path)?)),
+           BackendType::Candle => Ok(Arc::new(CandleModel::new(path)?)),
+       }
+   }
+   ```
+
+2. **Error Handling**
+   - Map external library errors to internal error types
+   - Provide context-rich error messages for debugging
+   - Use thiserror for clear error definitions
+   ```rust
+   #[derive(Debug, Error)]
+   pub enum ModelError {
+       #[error("LibTorch error: {0}")]
+       Tch(#[from] tch::TchError),
+       
+       #[error("Candle error: {0}")]
+       Candle(#[from] candle_core::Error),
+   }
+   ```
+
+3. **Type Conversion**
+   - Provide utility functions for converting between different backend types
+   - Handle cross-backend compatibility systematically
+   - Document expected behavior during type conversion
+   ```rust
+   pub fn convert_tch_to_candle_tensor(t: &tch::Tensor) -> Result<candle_core::Tensor> {
+       // Conversion logic...
+   }
+   ```
+
+## Testing
+
+1. **Cross-Backend Testing**
+   - Test functionality across all supported backends
+   - Create abstraction test suites that run against all implementations
+   - Verify numerical stability and output consistency across backends
+   ```rust
+   #[test]
+   fn test_all_backends() {
+       let backends = [BackendType::Tch, BackendType::Candle];
+       for backend in backends {
+           let model = create_test_model(backend).unwrap();
+           assert_eq!(model.predict(test_input), expected_output);
+       }
+   }
+   ```
+
+2. **Integration Tests**
+   - Create integration tests that verify the entire pipeline
+   - Test real-world use cases with realistic inputs
+   - Benchmark performance across backends for comparison
+   ```rust
+   #[test]
+   fn test_end_to_end_pipeline() {
+       let pipeline = create_pipeline(config_path).unwrap();
+       let result = pipeline.process(test_audio).unwrap();
+       assert_close(result, expected_output, 1e-4); // Numerically stable comparison
+   }
+   ```
+
+3. **Gradual Migration Strategy**
+   - When migrating between backends, create feature parity tests
+   - Document differences in behavior or precision
+   - Provide migration guides for users
+   ```rust
+   // Migrate from tch to candle with parity testing
+   #[test]
+   fn verify_parity_between_tch_and_candle() {
+       let tch_model = create_tch_model(path).unwrap();
+       let candle_model = create_candle_model(path).unwrap();
+       
+       let tch_output = tch_model.predict(test_input).unwrap();
+       let candle_output = candle_model.predict(test_input).unwrap();
+       
+       assert_mean_squared_error(tch_output, candle_output) < 1e-5;
+   }
+   ```

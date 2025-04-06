@@ -5,11 +5,8 @@ use std::fmt;
 use tokio::sync::Mutex as TokioMutex;
 use anyhow::{Result, anyhow};
 use tracing::{debug, warn};
-use crate::models::CSMModel; // Keep only needed traits/types from models
- // Add import for ModelError
- // Add import for mpsc
- // Add import for info macro
- // Import the attribute macro
+use crate::models::CSMModel;
+use crate::audio::AudioProcessing;
 
 const MAX_BUFFER_SIZE: usize = 48000 * 5; // 5 seconds at 48kHz
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(5);
@@ -442,10 +439,10 @@ impl StreamingAudioProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::prosody::ProsodyControl;
+    use crate::models::{ModelError, AudioOutput};
     
-    use crate::models::ModelError;
-    use tokio::sync::mpsc;
-    use tracing::info;
+    use tracing::{info, warn};
     use async_trait::async_trait;
 
     #[derive(Clone)] 
@@ -457,37 +454,72 @@ mod tests {
 
     #[async_trait]
     impl CSMModel for TestCSMModel {
+        fn get_config(&self) -> Result<crate::models::config::CsmModelConfig, ModelError> {
+            Ok(Default::default())
+        }
+
+        fn get_processor(&self) -> Result<Arc<TokioMutex<dyn AudioProcessing + Send + Sync>>, ModelError> {
+            Err(ModelError::NotImplemented)
+        }
+
+        async fn predict_rvq_tokens(
+            &self,
+            _text: &str,
+            _conversation_history: Option<&crate::context::ConversationHistory>,
+            _temperature: Option<f32>,
+        ) -> Result<Vec<Vec<i64>>, ModelError> {
+            warn!("TestCSMModel::predict_rvq_tokens called (not implemented).");
+            Ok(vec![vec![0i64; 5]])
+        }
+
         async fn synthesize(
             &self,
             _text: &str,
-            _temperature: Option<f64>,
+            _conversation_history: Option<&crate::context::ConversationHistory>,
+            _temperature: Option<f32>,
             _top_k: Option<i64>,
-            _seed: Option<u64>,
-        ) -> Result<Vec<i16>, ModelError> {
+            _seed: Option<i64>,
+        ) -> Result<AudioOutput, ModelError> {
             info!("TestCSMModel synthesize called");
-            Ok(vec![0i16; 512])
+            Ok(AudioOutput {
+                samples: vec![0i16; 512],
+                sample_rate: 24000,
+            })
         }
 
         async fn synthesize_streaming(
             &self,
             _text: &str,
-            _temperature: Option<f64>,
-            _top_k: Option<i64>,
-            _seed: Option<u64>,
-            audio_token_tx: mpsc::Sender<Vec<(i64, Vec<i64>)>>,
+            _prosody: Option<ProsodyControl>,
+            _style_preset: Option<String>,
+            chunk_tx: tokio::sync::mpsc::Sender<Result<Vec<u8>, ModelError>>,
         ) -> Result<(), ModelError> {
-            info!("TestCSMModel synthesize_streaming called (sending mock tokens)");
-            // Send mock token data
-            for i in 0..2 { 
-                let mock_acoustic_tokens: Vec<i64> = vec![(i+5) as i64; 8]; // Example: 8 codebooks
-                let mock_semantic_token = (i+5) as i64; // Dummy semantic token
-                let chunk_to_send = vec![(mock_semantic_token, mock_acoustic_tokens)]; 
-                if audio_token_tx.send(chunk_to_send).await.is_err() {
-                    warn!("TestCSMModel: Failed to send token chunk.");
-                    return Err(ModelError::ChannelSendError("TestCSMModel send failed".to_string()));
+            info!("TestCSMModel synthesize_streaming called (sending mock bytes)");
+            // Send mock byte data
+            for i in 0..2 {
+                let is_final = i == 1;
+                let audio_bytes = if is_final { Vec::new() } else { vec![1u8; 512] }; // Example bytes
+
+                if chunk_tx.send(Ok(audio_bytes)).await.is_err() {
+                    warn!("TestCSMModel: Chunk receiver dropped.");
+                    break;
                 }
             }
             Ok(())
+        }
+        
+        async fn synthesize_codes(
+            &self,
+        ) -> Result<AudioOutput, ModelError> {
+            warn!("TestCSMModel::synthesize_codes is not implemented.");
+            Err(ModelError::NotImplemented)
+        }
+
+        async fn synthesize_codes_streaming(
+            &self,
+        ) -> Result<(), ModelError> {
+            warn!("TestCSMModel::synthesize_codes_streaming is not implemented.");
+            Err(ModelError::NotImplemented)
         }
     }
 
@@ -509,7 +541,7 @@ mod tests {
             stream.write_audio(chunk).await?;
         }
 
-        // Process stream
+        // Process stream - note that the model now requires &mut to call methods
         let model = Arc::new(TokioMutex::new(Box::new(TestCSMModel::new()) as Box<dyn CSMModel + Send>));
         let processed = stream.process_with_model(model).await?;
 
@@ -611,3 +643,31 @@ impl ConversationState {
 */
 
 // ProsodyParams implementations are defined in src/models/mod.rs
+
+/*
+pub struct AudioStreamer {
+    model: Arc<CSMModel>, // Use Arc<CSMModel>
+    sample_rate: u32,
+    // Add other fields as necessary, e.g., audio sink
+}
+
+impl AudioStreamer {
+    pub fn new(model: Arc<CSMModel>) -> Self {
+        let sample_rate = model.sample_rate();
+        Self {
+            model,
+            sample_rate,
+            // Initialize other fields
+        }
+    }
+
+    pub async fn synthesize_text_to_stream(
+        &self,
+        _text: &str,
+    ) -> Result<(), anyhow::Error> {
+        // Implementation using self.model.synthesize_streaming
+        // ...
+        Ok(())
+    }
+}
+*/

@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::any::Any;
 use anyhow::{Result, Context as AnyhowContext};
 use tch::{Tensor, Device};
 use tokio::sync::Mutex as TokioMutex;
@@ -35,9 +36,9 @@ pub struct LlmConfig {
     /// Path to the model weights file (if using a local model)
     pub model_path: Option<PathBuf>,
     /// Model identifier for API-based models
-    pub model_id: Option<String>,
+    pub _model_id: Option<String>,
     /// API key for cloud-based LLMs
-    pub api_key: Option<String>,
+    pub _api_key: Option<String>,
     /// Embedding dimension for context embeddings
     pub embedding_dim: i64,
     /// Use GPU acceleration if available
@@ -45,9 +46,9 @@ pub struct LlmConfig {
     /// Maximum context window size
     pub max_context_window: usize,
     /// Temperature for text generation
-    pub temperature: f64,
+    pub _temperature: f64,
     /// Other model-specific parameters
-    pub parameters: std::collections::HashMap<String, String>,
+    pub _parameters: std::collections::HashMap<String, String>,
 }
 
 impl Default for LlmConfig {
@@ -55,13 +56,13 @@ impl Default for LlmConfig {
         Self {
             llm_type: LlmType::Mock,
             model_path: None,
-            model_id: None,
-            api_key: None,
+            _model_id: None,
+            _api_key: None,
             embedding_dim: 768,
             use_gpu: true,
             max_context_window: 4096,
-            temperature: 0.7,
-            parameters: std::collections::HashMap::new(),
+            _temperature: 0.7,
+            _parameters: std::collections::HashMap::new(),
         }
     }
 }
@@ -100,7 +101,7 @@ pub struct LlamaService {
     template_registry: PromptTemplateRegistry,
     // Using a mutex to ensure thread safety for the model
     model: TokioMutex<tch::CModule>,
-    device: Device,
+    _device: Device,
 }
 
 impl LlamaService {
@@ -128,7 +129,7 @@ impl LlamaService {
             embedding_generator: ContextEmbeddingGenerator::new(embedding_config),
             template_registry: PromptTemplateRegistry::new(),
             model: TokioMutex::new(model),
-            device,
+            _device: device,
         })
     }
     
@@ -184,6 +185,10 @@ impl LlmProcessor for LlamaService {
             self.generate_response_async(context).await
         })
     }
+    
+    fn _as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl LlamaService {
@@ -221,7 +226,7 @@ pub struct MistralService {
     template_registry: PromptTemplateRegistry,
     // Similar structure to LlamaService, but with Mistral-specific implementation
     model: TokioMutex<tch::CModule>,
-    device: Device,
+    _device: Device,
 }
 
 impl MistralService {
@@ -249,7 +254,7 @@ impl MistralService {
             embedding_generator: ContextEmbeddingGenerator::new(embedding_config),
             template_registry: PromptTemplateRegistry::new(),
             model: TokioMutex::new(model),
-            device,
+            _device: device,
         })
     }
     
@@ -300,6 +305,10 @@ impl LlmProcessor for MistralService {
             self.generate_response_async(context).await
         })
     }
+    
+    fn _as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl MistralService {
@@ -336,7 +345,7 @@ pub struct LocalModelService {
     embedding_generator: ContextEmbeddingGenerator,
     template_registry: PromptTemplateRegistry,
     model: TokioMutex<tch::CModule>,
-    device: Device,
+    _device: Device,
 }
 
 impl LocalModelService {
@@ -360,7 +369,7 @@ impl LocalModelService {
             embedding_generator: ContextEmbeddingGenerator::new(embedding_config),
             template_registry: PromptTemplateRegistry::new(),
             model: TokioMutex::new(model),
-            device,
+            _device: device,
         })
     }
     
@@ -411,6 +420,10 @@ impl LlmProcessor for LocalModelService {
             self.generate_response_async(context).await
         })
     }
+    
+    fn _as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 impl LocalModelService {
@@ -444,8 +457,8 @@ impl LocalModelService {
 /// Mock implementation of LLM service for testing
 pub struct MockLlmService {
     config: LlmConfig,
-    embedding_generator: ContextEmbeddingGenerator,
-    template_registry: PromptTemplateRegistry,
+    _embedding_generator: ContextEmbeddingGenerator,
+    _template_registry: PromptTemplateRegistry,
 }
 
 impl MockLlmService {
@@ -457,8 +470,8 @@ impl MockLlmService {
         
         Self {
             config,
-            embedding_generator: ContextEmbeddingGenerator::new(embedding_config),
-            template_registry: PromptTemplateRegistry::new(),
+            _embedding_generator: ContextEmbeddingGenerator::new(embedding_config),
+            _template_registry: PromptTemplateRegistry::new(),
         }
     }
 }
@@ -501,5 +514,9 @@ impl LlmProcessor for MockLlmService {
         }
         
         Ok("I'm not sure what to say. Can you please tell me more?".to_string())
+    }
+    
+    fn _as_any(&self) -> &dyn Any {
+        self
     }
 } 

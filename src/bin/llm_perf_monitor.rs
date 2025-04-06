@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::Parser;
 use tracing::{info, warn};
 use csm::llm_integration::{
@@ -69,12 +69,16 @@ fn create_sample_history() -> ConversationHistory {
         "Hello, how are you today?".to_string()
     ));
     history.add_turn(csm::context::ConversationTurn::new(
-        csm::context::Speaker::Model,
+        csm::context::Speaker::Assistant,
         "I'm doing well, thank you for asking! How can I help you today?".to_string()
     ));
     history.add_turn(csm::context::ConversationTurn::new(
         csm::context::Speaker::User,
         "Can you tell me about the weather forecast for tomorrow?".to_string()
+    ));
+    history.add_turn(csm::context::ConversationTurn::new(
+        csm::context::Speaker::Assistant,
+        "Mock response".to_string(),
     ));
     history
 }

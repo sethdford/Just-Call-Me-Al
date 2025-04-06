@@ -1,27 +1,31 @@
+#![allow(dead_code)] // Allow dead code for this optimization module
+
 //! LLM Inference Optimization
 //!
 //! This module provides optimization techniques for LLM inference
 //! to ensure real-time performance in speech synthesis applications.
 
-use std::sync::Arc;
-use std::any::Any;
-use tch::{Device, Tensor, nn, CModule};
-use std::time::Instant;
-use anyhow::{Result, Context as AnyhowContext};
-use tracing::debug;
-use tokio::sync::Mutex as TokioMutex;
-use async_trait::async_trait;
-use dashmap::DashMap;
+use std::hash::{Hash, Hasher};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::any::Any;
+use std::time::Instant;
+use std::sync::Arc;
 
+use tokio::sync::RwLock;
+use tch::{Device, Tensor, CModule};
+use anyhow::Result;
+use tracing::debug;
+
+use crate::llm_integration::context_embeddings::ContextEmbedding;
+use crate::llm_integration::LlmProcessor;
 use crate::context::ConversationHistory;
-use super::{ContextEmbedding, LlmProcessor};
 
 /// Cache for tensor computations to avoid redundant operations
 #[derive(Debug)]
 pub struct ComputationCache {
     /// Store tensor hashes by input hash (just a placeholder for now)
-    tensors: TokioMutex<HashMap<u64, bool>>,
+    tensors: RwLock<HashMap<u64, bool>>,
     /// Maximum number of entries to store in the cache
     max_entries: usize,
 }
@@ -30,7 +34,7 @@ impl ComputationCache {
     /// Create a new computation cache with the specified capacity
     pub fn new(max_entries: usize) -> Self {
         Self {
-            tensors: TokioMutex::new(HashMap::new()),
+            tensors: RwLock::new(HashMap::new()),
             max_entries,
         }
     }
@@ -42,26 +46,20 @@ impl ComputationCache {
     where 
         F: FnOnce() -> Result<Tensor>
     {
-        let mut cache = self.tensors.lock().await;
+        let mut cache = self.tensors.write().await;
         
         // Just compute the value for now - this is simplified
         let result = compute_fn()?;
         
-        // Mark as cached
-        if !cache.contains_key(&key) {
-            if cache.len() >= self.max_entries {
-                debug!("ComputationCache: Pruning cache (size: {})", cache.len());
-                let keys: Vec<u64> = cache.keys().copied().take(self.max_entries / 4).collect();
-                for k in keys {
-                    cache.remove(&k);
-                }
+        // Track in cache
+        cache.insert(key, true);
+        
+        // Enforce size limit
+        if cache.len() > self.max_entries {
+            // Remove oldest entry (simple approach)
+            if let Some(k) = cache.keys().next().copied() {
+                cache.remove(&k);
             }
-            
-            // Just store a bool to mark that we've seen this key
-            cache.insert(key, true);
-            debug!("ComputationCache: Stored key {}", key);
-        } else {
-            debug!("ComputationCache: Cache hit for key {}", key);
         }
         
         Ok(result)
@@ -70,12 +68,12 @@ impl ComputationCache {
     /// Clear the cache
     pub async fn clear(&self) {
         debug!("ComputationCache: Clearing cache");
-        self.tensors.lock().await.clear();
+        self.tensors.write().await.clear();
     }
     
     /// Check if the cache contains a key
     pub async fn contains_key(&self, key: &u64) -> bool {
-        self.tensors.lock().await.contains_key(key)
+        self.tensors.read().await.contains_key(key)
     }
 }
 
@@ -90,7 +88,7 @@ pub struct OptimizedLlm {
     /// Whether to use inference optimizations like KV caching
     enable_kv_cache: bool,
     /// Track inference timing statistics
-    timing_stats: Arc<TokioMutex<TimingStats>>,
+    timing_stats: Arc<RwLock<TimingStats>>,
 }
 
 /// Timing statistics for performance monitoring
@@ -162,7 +160,7 @@ impl OptimizedLlm {
             cache: Arc::new(ComputationCache::new(100)),
             enable_batching: true,
             enable_kv_cache: true,
-            timing_stats: Arc::new(TokioMutex::new(TimingStats::default())),
+            timing_stats: Arc::new(RwLock::new(TimingStats::default())),
         }
     }
     
@@ -175,19 +173,16 @@ impl OptimizedLlm {
     
     /// Get current timing statistics
     pub async fn get_timing_stats(&self) -> TimingStats {
-        self.timing_stats.lock().await.clone()
+        self.timing_stats.read().await.clone()
     }
     
     /// Reset timing statistics
     pub async fn reset_timing_stats(&self) {
-        self.timing_stats.lock().await.reset();
+        self.timing_stats.write().await.reset();
     }
     
     /// Generate a hash key for context embedding caching
     fn generate_context_hash(&self, context: &ConversationHistory) -> u64 {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        
         let formatted = context.format_for_prompt(4000);
         let mut hasher = DefaultHasher::new();
         formatted.hash(&mut hasher);
@@ -205,7 +200,7 @@ impl OptimizedLlm {
             
             if has_key {
                 // Cache hit - update stats, but we still need to recompute
-                let mut stats = self.timing_stats.lock().await;
+                let mut stats = self.timing_stats.write().await;
                 stats.cache_hits += 1;
                 drop(stats); // Release lock
                 
@@ -215,7 +210,7 @@ impl OptimizedLlm {
                 Ok(embedding)
             } else {
                 // Cache miss - compute and update stats
-                let mut stats = self.timing_stats.lock().await;
+                let mut stats = self.timing_stats.write().await;
                 stats.cache_misses += 1;
                 drop(stats); // Release lock on stats
                 
@@ -223,10 +218,11 @@ impl OptimizedLlm {
                 let embedding = self.inner.generate_embeddings(context)?;
                 
                 // Mark as seen in cache
-                self.cache.get_or_compute(
+                let tensor = self.cache.get_or_compute(
                     hash_key,
                     || Ok(embedding.tensor.copy())
                 ).await?;
+                debug!("Cached tensor shape: {:?}", tensor.size());
                 
                 // Return the embedding
                 Ok(embedding)
@@ -238,7 +234,7 @@ impl OptimizedLlm {
         
         // Update timing statistics
         let elapsed = start.elapsed().as_millis() as u64;
-        let mut stats = self.timing_stats.lock().await;
+        let mut stats = self.timing_stats.write().await;
         stats.embedding_count += 1;
         stats.embedding_time_ms += elapsed;
         
@@ -262,7 +258,7 @@ pub trait OptimizedInference {
 }
 
 /// Implementation for torch CModule-based models
-impl OptimizedInference for TokioMutex<CModule> {
+impl OptimizedInference for RwLock<CModule> {
     fn optimize_for_inference(&mut self, _device: Device) -> Result<()> {
         // This would be implemented with torch JIT optimizations
         // and other techniques specific to the model architecture
@@ -336,7 +332,7 @@ impl LlmProcessor for OptimizedLlm {
         let elapsed = start.elapsed().as_millis() as u64;
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let mut stats = self.timing_stats.lock().await;
+            let mut stats = self.timing_stats.write().await;
             stats.text_count += 1;
             stats.text_time_ms += elapsed;
         });
@@ -355,7 +351,7 @@ impl LlmProcessor for OptimizedLlm {
         let elapsed = start.elapsed().as_millis() as u64;
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
-            let mut stats = self.timing_stats.lock().await;
+            let mut stats = self.timing_stats.write().await;
             stats.response_count += 1;
             stats.response_time_ms += elapsed;
         });
@@ -363,7 +359,7 @@ impl LlmProcessor for OptimizedLlm {
         result
     }
     
-    fn as_any(&self) -> &dyn Any {
+    fn _as_any(&self) -> &dyn Any {
         self
     }
 } 
